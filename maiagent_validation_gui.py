@@ -25,6 +25,8 @@ import re
 import subprocess
 import sys
 import threading
+# 隱藏 macOS Tk 廢棄警告
+os.environ['TK_SILENCE_DEPRECATION'] = '1'
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from dataclasses import dataclass
@@ -97,8 +99,8 @@ class ValidationRow:
     
     # API 回覆結果（自動填入）
     AI助理回覆: str = ""
-    引用節點: str = ""
-    參考文件: str = ""
+    # 動態引用節點欄位（將在處理時動態添加）
+    # 動態參考文件欄位（將在處理時動態添加）
     
     # 驗證結果（自動填入）
     引用節點是否命中: str = ""
@@ -110,6 +112,16 @@ class ValidationRow:
     recall: float = 0.0
     f1_score: float = 0.0
     hit_rate: float = 0.0
+    
+    # 用於儲存原始 API 回傳數據
+    _raw_citation_nodes: List[Dict] = None
+    _raw_citations: List[Dict] = None
+    
+    def __post_init__(self):
+        if self._raw_citation_nodes is None:
+            self._raw_citation_nodes = []
+        if self._raw_citations is None:
+            self._raw_citations = []
 
 
 @dataclass
@@ -204,14 +216,14 @@ class MaiAgentApiClient:
                     import json
                     try:
                         payload_str = json.dumps(payload, indent=2, ensure_ascii=False)
-                        # 限制載荷長度以避免日誌過長
-                        if len(payload_str) > 500:
-                            payload_str = payload_str[:500] + "...(內容已截斷)"
+                        # 限制載荷長度以避免日誌過長 - 增加到2000字元
+                        if len(payload_str) > 2000:
+                            payload_str = payload_str[:2000] + "...(內容已截斷)"
                         details.append(f"     {payload_str}")
                     except:
-                        details.append(f"     {str(payload)[:500]}...")
+                        details.append(f"     {str(payload)[:2000]}...")
                 else:
-                    details.append(f"     {str(payload)[:500]}...")
+                    details.append(f"     {str(payload)[:2000]}...")
             
             # 發送詳細日誌
             for detail in details:
@@ -246,19 +258,19 @@ class MaiAgentApiClient:
                     import json
                     try:
                         response_str = json.dumps(response_data, indent=2, ensure_ascii=False)
-                        # 限制回應長度以避免日誌過長
-                        if len(response_str) > 1000:
-                            response_str = response_str[:1000] + "...(內容已截斷)"
+                        # 限制回應長度以避免日誌過長 - 增加到5000字元
+                        if len(response_str) > 5000:
+                            response_str = response_str[:5000] + "...(內容已截斷)"
                         details.append(f"     {response_str}")
                     except:
                         details.append(f"     {str(response_data)[:1000]}...")
                 elif isinstance(response_data, str):
-                    if len(response_data) > 1000:
-                        details.append(f"     {response_data[:1000]}...(內容已截斷)")
+                    if len(response_data) > 5000:
+                        details.append(f"     {response_data[:5000]}...(內容已截斷)")
                     else:
                         details.append(f"     {response_data}")
                 else:
-                    details.append(f"     {str(response_data)[:1000]}...")
+                    details.append(f"     {str(response_data)[:5000]}...")
             
             # 發送詳細日誌
             log_level = 'log_info' if 200 <= status_code < 300 else 'log_error'
@@ -271,7 +283,20 @@ class MaiAgentApiClient:
             'Authorization': f'Api-Key {self.api_key}',
             'Content-Type': 'application/json'
         }
-        self.session = aiohttp.ClientSession(headers=headers)
+        # 添加超時設定和連接池配置
+        timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
+        connector = aiohttp.TCPConnector(
+            limit=100,  # 總連接池大小
+            limit_per_host=20,  # 每個主機的連接數
+            enable_cleanup_closed=True,  # 啟用清理關閉的連接
+            force_close=False,  # 允許連接重用以提高性能
+            keepalive_timeout=30  # 保持連接的超時時間
+        )
+        self.session = aiohttp.ClientSession(
+            headers=headers, 
+            timeout=timeout,
+            connector=connector
+        )
         return self
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -279,29 +304,58 @@ class MaiAgentApiClient:
             await self.session.close()
     
     async def get_chatbots(self) -> List[Dict]:
-        """獲取可用的聊天機器人列表"""
+        """獲取可用的聊天機器人列表（支援分頁）"""
         if not self.session:
             raise Exception("API Client session not initialized")
             
+        all_chatbots = []
         url = self._build_api_url("chatbots/")
-        start_time = pd.Timestamp.now()
+        page_number = 1
         
-        self._log_api_request(url, 'GET')
+        while url:
+            start_time = pd.Timestamp.now()
+            
+            self._log_api_request(url, 'GET')
+            
+            async with self.session.get(url) as response:
+                duration = (pd.Timestamp.now() - start_time).total_seconds()
+                response_text = await response.text()
+                
+                self._log_api_response(url, response.status, len(response_text), duration)
+                
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if isinstance(data, list):
+                        # 直接返回列表（非分頁格式）
+                        return data
+                    elif isinstance(data, dict):
+                        # 分頁格式
+                        current_results = data.get('results', [])
+                        all_chatbots.extend(current_results)
+                        
+                        # 檢查是否有下一頁
+                        next_url = data.get('next')
+                        if next_url:
+                            url = next_url
+                            page_number += 1
+                            # 記錄分頁進度
+                            total_count = data.get('count', 0)
+                            current_count = len(all_chatbots)
+                            if self.logger_callback:
+                                self.logger_callback('log_info', f"📄 已載入第 {page_number-1} 頁，共 {current_count}/{total_count} 個聊天機器人")
+                        else:
+                            # 沒有下一頁，結束循環
+                            url = None
+                    else:
+                        return []
+                else:
+                    raise Exception(f"獲取聊天機器人列表失敗: {response.status} - {response_text}")
         
-        async with self.session.get(url) as response:
-            duration = (pd.Timestamp.now() - start_time).total_seconds()
-            response_text = await response.text()
-            
-            self._log_api_response(url, response.status, len(response_text), duration)
-            
-            if response.status == 200:
-                data = await response.json()
-                return data.get('results', [])
-            else:
-                raise Exception(f"獲取聊天機器人列表失敗: {response.status} - {response_text}")
+        return all_chatbots
     
-    async def send_message(self, chatbot_id: str, message: str, conversation_id: Optional[str] = None) -> ApiResponse:
-        """發送訊息到指定的聊天機器人"""
+    async def send_message(self, chatbot_id: str, message: str, conversation_id: Optional[str] = None, max_retries: int = 3) -> ApiResponse:
+        """發送訊息到指定的聊天機器人（具備重試機制）"""
         if not self.session:
             raise Exception("API Client session not initialized")
             
@@ -316,25 +370,93 @@ class MaiAgentApiClient:
             "isStreaming": False
         }
         
-        start_time = pd.Timestamp.now()
-        self._log_api_request(url, 'POST', payload)
+        last_exception = None
         
-        async with self.session.post(url, json=payload) as response:
-            duration = (pd.Timestamp.now() - start_time).total_seconds()
-            response_text = await response.text()
-            
-            self._log_api_response(url, response.status, len(response_text), duration)
-            
-            if response.status == 200:
-                data = await response.json()
-                return ApiResponse(
-                    conversation_id=data.get('conversationId'),
-                    content=data.get('content', ''),
-                    citations=data.get('citations', []),
-                    citation_nodes=data.get('citationNodes', [])
-                )
-            else:
-                raise Exception(f"發送訊息失敗: {response.status} - {response_text}")
+        for attempt in range(max_retries):
+            try:
+                start_time = pd.Timestamp.now()
+                self._log_api_request(url, 'POST', payload)
+                
+                async with self.session.post(url, json=payload) as response:
+                    duration = (pd.Timestamp.now() - start_time).total_seconds()
+                    response_text = await response.text()
+                    
+                    # 記錄原始回應文本
+                    self._log_api_response(url, response.status, len(response_text), duration, response_data=response_text)
+                    
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        # 額外記錄解析後的JSON結構以便於除錯
+                        if self.logger_callback:
+                            self.logger_callback('log_info', f"🔍 解析後的API回應結構:", 'API')
+                            self.logger_callback('log_info', f"   - conversationId: {data.get('conversationId', 'N/A')}", 'API')
+                            self.logger_callback('log_info', f"   - content length: {len(data.get('content', ''))}", 'API')
+                            self.logger_callback('log_info', f"   - citations count: {len(data.get('citations', []))}", 'API')
+                            self.logger_callback('log_info', f"   - citationNodes count: {len(data.get('citationNodes', []))}", 'API')
+                            
+                            # 記錄citations結構
+                            citations = data.get('citations', [])
+                            if citations:
+                                self.logger_callback('log_info', f"   📄 Citations 詳情:", 'API')
+                                for i, citation in enumerate(citations[:3], 1):  # 只顯示前3個
+                                    self.logger_callback('log_info', f"     {i}. filename: {citation.get('filename', 'N/A')}", 'API')
+                                    self.logger_callback('log_info', f"        labels: {citation.get('labels', [])}", 'API')
+                            
+                            # 記錄citationNodes結構
+                            citation_nodes = data.get('citationNodes', [])
+                            if citation_nodes:
+                                self.logger_callback('log_info', f"   📝 CitationNodes 詳情:", 'API')
+                                for i, node in enumerate(citation_nodes[:3], 1):  # 只顯示前3個
+                                    if 'chatbotTextNode' in node:
+                                        if 'text' in node['chatbotTextNode']:
+                                            content_preview = node['chatbotTextNode'].get('text', '')[:100]
+                                            self.logger_callback('log_info', f"     {i}. chatbotTextNode.text: {content_preview}...", 'API')
+                                        elif 'content' in node['chatbotTextNode']:
+                                            content_preview = node['chatbotTextNode'].get('content', '')[:100]
+                                            self.logger_callback('log_info', f"     {i}. chatbotTextNode.content: {content_preview}...", 'API')
+                                        else:
+                                            self.logger_callback('log_info', f"     {i}. chatbotTextNode結構: {list(node['chatbotTextNode'].keys())}", 'API')
+                                    elif 'text' in node:
+                                        content_preview = node.get('text', '')[:100]
+                                        self.logger_callback('log_info', f"     {i}. text: {content_preview}...", 'API')
+                                    else:
+                                        self.logger_callback('log_info', f"     {i}. 結構: {list(node.keys())}", 'API')
+                        
+                        return ApiResponse(
+                            conversation_id=data.get('conversationId'),
+                            content=data.get('content', ''),
+                            citations=data.get('citations', []),
+                            citation_nodes=data.get('citationNodes', [])
+                        )
+                    else:
+                        raise Exception(f"發送訊息失敗: {response.status} - {response_text}")
+                        
+            except (aiohttp.ClientError, aiohttp.ServerTimeoutError, asyncio.TimeoutError, 
+                    ConnectionError, OSError) as e:
+                last_exception = e
+                if self.logger_callback:
+                    self.logger_callback('log_warning', f"⚠️ API 請求失敗 (嘗試 {attempt + 1}/{max_retries}): {str(e)}", 'API')
+                
+                if attempt < max_retries - 1:
+                    # 指數退避策略：每次重試等待時間加倍
+                    wait_time = 2 ** attempt
+                    if self.logger_callback:
+                        # 使用安全的日誌記錄方式，避免 GUI 線程問題
+                        try:
+                            self.logger_callback('log_info', f"   ⏰ {wait_time} 秒後重試...", 'API')
+                        except Exception:
+                            print(f"   ⏰ {wait_time} 秒後重試...")
+                    await asyncio.sleep(wait_time)
+                    
+        # 所有重試都失敗了
+        if last_exception:
+            error_msg = f"API 請求在 {max_retries} 次重試後仍然失敗: {str(last_exception)}"
+            if self.logger_callback:
+                self.logger_callback('log_error', f"❌ {error_msg}", 'API')
+            raise Exception(error_msg)
+        else:
+            raise Exception("API 請求失敗，未知錯誤")
     
     # === 組織管理功能 ===
     
@@ -476,89 +598,306 @@ class MaiAgentApiClient:
     # === 知識庫管理功能 ===
     
     async def get_knowledge_bases(self) -> List[Dict]:
-        """獲取知識庫列表"""
+        """獲取知識庫列表（支援分頁）"""
         if not self.session:
             raise Exception("API Client session not initialized")
 
+        all_knowledge_bases = []
         url = self._build_api_url("knowledge-bases/")
-        start_time = pd.Timestamp.now()
+        page_number = 1
+        
+        while url:
+            start_time = pd.Timestamp.now()
 
-        # 記錄請求詳情（包含headers）
-        request_headers = dict(self.session.headers) if hasattr(self.session, 'headers') else {}
-        self._log_api_request(url, 'GET', headers=request_headers)
+            # 記錄請求詳情（包含headers）
+            request_headers = dict(self.session.headers) if hasattr(self.session, 'headers') else {}
+            self._log_api_request(url, 'GET', headers=request_headers)
 
-        async with self.session.get(url) as response:
-            duration = (pd.Timestamp.now() - start_time).total_seconds()
-            response_text = await response.text()
-            
-            # 記錄回應詳情（包含headers和內容）
-            response_headers = dict(response.headers)
-            try:
-                response_data = await response.json() if response_text else None
-            except:
-                response_data = response_text
-
-            self._log_api_response(url, response.status, len(response_text), duration, 
-                                 response_data=response_data, response_headers=response_headers)
-
-            if response.status == 200:
-                data = await response.json()
-                if isinstance(data, list):
-                    return data
-                elif isinstance(data, dict):
-                    return data.get('results', [])
-                else:
-                    return []
-            else:
-                raise Exception(f"獲取知識庫列表失敗: {response.status} - {response_text}")
-    
-    async def get_knowledge_base_files(self, kb_id: str) -> List[Dict]:
-        """獲取知識庫文件列表"""
-        if not self.session:
-            raise Exception("API Client session not initialized")
-
-        url = self._build_api_url(f"knowledge-bases/{kb_id}/files/")
-        start_time = pd.Timestamp.now()
-
-        self._log_api_request(url, 'GET')
-
-        async with self.session.get(url) as response:
-            duration = (pd.Timestamp.now() - start_time).total_seconds()
-            response_text = await response.text()
-
-            self._log_api_response(url, response.status, len(response_text), duration)
-
-            if response.status == 200:
-                data = await response.json()
-                if isinstance(data, list):
-                    return data
-                elif isinstance(data, dict):
-                    return data.get('results', [])
-                else:
-                    return []
-            else:
-                raise Exception(f"獲取知識庫文件列表失敗: {response.status} - {response_text}")
-    
-    async def download_knowledge_base_file(self, kb_id: str, file_id: str) -> bytes:
-        """下載知識庫文件"""
-        if not self.session:
-            raise Exception("API Client session not initialized")
-
-        url = self._build_api_url(f"knowledge-bases/{kb_id}/files/{file_id}/download/")
-        start_time = pd.Timestamp.now()
-
-        self._log_api_request(url, 'GET')
-
-        async with self.session.get(url) as response:
-            duration = (pd.Timestamp.now() - start_time).total_seconds()
-            
-            self._log_api_response(url, response.status, 0, duration)
-
-            if response.status == 200:
-                return await response.read()
-            else:
+            async with self.session.get(url) as response:
+                duration = (pd.Timestamp.now() - start_time).total_seconds()
                 response_text = await response.text()
-                raise Exception(f"下載文件失敗: {response.status} - {response_text}")
+                
+                # 記錄回應詳情（包含headers和內容）
+                response_headers = dict(response.headers)
+                try:
+                    response_data = await response.json() if response_text else None
+                except:
+                    response_data = response_text
+
+                self._log_api_response(url, response.status, len(response_text), duration, 
+                                     response_data=response_data, response_headers=response_headers)
+
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if isinstance(data, list):
+                        # 直接返回列表（非分頁格式）
+                        return data
+                    elif isinstance(data, dict):
+                        # 分頁格式
+                        current_results = data.get('results', [])
+                        all_knowledge_bases.extend(current_results)
+                        
+                        # 檢查是否有下一頁
+                        next_url = data.get('next')
+                        if next_url:
+                            url = next_url
+                            page_number += 1
+                            # 記錄分頁進度
+                            total_count = data.get('count', 0)
+                            current_count = len(all_knowledge_bases)
+                            if self.logger_callback:
+                                self.logger_callback('log_info', f"📄 已載入第 {page_number-1} 頁，共 {current_count}/{total_count} 個知識庫")
+                        else:
+                            # 沒有下一頁，結束循環
+                            url = None
+                    else:
+                        return []
+                else:
+                    raise Exception(f"獲取知識庫列表失敗: {response.status} - {response_text}")
+        
+        return all_knowledge_bases
+    
+    async def get_knowledge_base_files(self, kb_id: str, progress_callback=None, load_all_at_once=True) -> List[Dict]:
+        """獲取知識庫文件列表（支援一次性載入或分頁載入）"""
+        if not self.session:
+            raise Exception("API Client session not initialized")
+
+        if load_all_at_once:
+            # 嘗試一次性載入所有文件
+            return await self._get_all_files_at_once(kb_id, progress_callback)
+        else:
+            # 使用原有分頁方式
+            return await self._get_files_paginated(kb_id, progress_callback)
+    
+    async def _get_all_files_at_once(self, kb_id: str, progress_callback=None) -> List[Dict]:
+        """一次性載入所有知識庫文件"""
+        # 先獲取第一頁來得到總數
+        url = self._build_api_url(f"knowledge-bases/{kb_id}/files/")
+        
+        start_time = pd.Timestamp.now()
+        self._log_api_request(url, 'GET')
+        
+        async with self.session.get(url) as response:
+            duration = (pd.Timestamp.now() - start_time).total_seconds()
+            response_text = await response.text()
+            self._log_api_response(url, response.status, len(response_text), duration)
+            
+            if response.status != 200:
+                raise Exception(f"獲取知識庫文件列表失敗: {response.status} - {response_text}")
+            
+            data = await response.json()
+            
+            if isinstance(data, list):
+                # 直接返回列表（非分頁格式）
+                if progress_callback:
+                    progress_callback(len(data), len(data))
+                if self.logger_callback:
+                    self.logger_callback('log_info', f"📄 一次性載入完成，共 {len(data)} 個文件")
+                return data
+            elif isinstance(data, dict):
+                total_count = data.get('count', 0)
+                if total_count == 0:
+                    return []
+                
+                # 嘗試用大的 page_size 一次性獲取所有文件
+                large_page_size = max(total_count, 10000)  # 至少10000，確保能獲取所有文件
+                url_with_size = self._build_api_url(f"knowledge-bases/{kb_id}/files/?page_size={large_page_size}")
+                
+                start_time = pd.Timestamp.now()
+                self._log_api_request(url_with_size, 'GET')
+                
+                async with self.session.get(url_with_size) as large_response:
+                    duration = (pd.Timestamp.now() - start_time).total_seconds()
+                    large_response_text = await large_response.text()
+                    self._log_api_response(url_with_size, large_response.status, len(large_response_text), duration)
+                    
+                    if large_response.status == 200:
+                        large_data = await large_response.json()
+                        all_files = large_data.get('results', [])
+                        
+                        if progress_callback:
+                            progress_callback(len(all_files), total_count)
+                        
+                        if self.logger_callback:
+                            self.logger_callback('log_info', f"📄 一次性載入完成，共 {len(all_files)}/{total_count} 個文件")
+                        
+                        return all_files
+                    else:
+                        # 如果大頁面載入失敗，回退到分頁模式
+                        if self.logger_callback:
+                            self.logger_callback('log_warning', f"一次性載入失敗，回退到分頁模式: {large_response.status}")
+                        return await self._get_files_paginated(kb_id, progress_callback)
+            else:
+                return []
+
+    async def _get_files_paginated(self, kb_id: str, progress_callback=None) -> List[Dict]:
+        """原有的分頁載入方式（備用）"""
+        all_files = []
+        url = self._build_api_url(f"knowledge-bases/{kb_id}/files/")
+        page_number = 1
+        total_count = 0
+        
+        while url:
+            start_time = pd.Timestamp.now()
+            self._log_api_request(url, 'GET')
+
+            async with self.session.get(url) as response:
+                duration = (pd.Timestamp.now() - start_time).total_seconds()
+                response_text = await response.text()
+                self._log_api_response(url, response.status, len(response_text), duration)
+
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if isinstance(data, list):
+                        if progress_callback:
+                            progress_callback(len(data), len(data))
+                        return data
+                    elif isinstance(data, dict):
+                        current_results = data.get('results', [])
+                        all_files.extend(current_results)
+                        
+                        next_url = data.get('next')
+                        total_count = data.get('count', 0)
+                        current_count = len(all_files)
+                        
+                        if progress_callback:
+                            progress_callback(current_count, total_count)
+                        
+                        if next_url:
+                            url = next_url
+                            page_number += 1
+                            if self.logger_callback:
+                                self.logger_callback('log_info', f"📄 已載入第 {page_number-1} 頁，共 {current_count}/{total_count} 個文件")
+                        else:
+                            url = None
+                    else:
+                        if progress_callback:
+                            progress_callback(0, 0)
+                        return []
+                else:
+                    raise Exception(f"獲取知識庫文件列表失敗: {response.status} - {response_text}")
+        
+        return all_files
+    
+    async def download_knowledge_base_file(self, kb_id: str, file_id: str, max_retries: int = 3) -> bytes:
+        """下載知識庫文件（支援重試機制）"""
+        if not self.session:
+            raise Exception("API Client session not initialized")
+
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    # 等待一段時間再重試
+                    await asyncio.sleep(2 ** attempt)  # 指數退避：2, 4, 8 秒
+                    # 使用安全的日誌記錄方式，避免 GUI 線程問題
+                    try:
+                        self.logger_callback('log_info', f"重試下載文件 {file_id}，第 {attempt + 1} 次嘗試")
+                    except Exception:
+                        print(f"重試下載文件 {file_id}，第 {attempt + 1} 次嘗試")
+                
+                # 先獲取文件的詳細信息，包含文件的 URL
+                file_detail_url = self._build_api_url(f"knowledge-bases/{kb_id}/files/{file_id}/")
+                start_time = pd.Timestamp.now()
+                
+                self._log_api_request(file_detail_url, 'GET')
+                
+                async with self.session.get(file_detail_url) as response:
+                    duration = (pd.Timestamp.now() - start_time).total_seconds()
+                    self._log_api_response(file_detail_url, response.status, 0, duration)
+                    
+                    if response.status == 200:
+                        file_data = await response.json()
+                        
+                        # 從文件詳細信息中獲取文件 URL
+                        file_url = None
+                        if 'file' in file_data and file_data['file']:
+                            file_url = file_data['file']
+                        
+                        if not file_url:
+                            raise Exception(f"文件 {file_id} 沒有可用的下載 URL")
+                        
+                        # 檢查文件狀態
+                        file_status = file_data.get('status', '')
+                        if file_status in ['deleting', 'failed']:
+                            raise Exception(f"文件 {file_id} 狀態為 {file_status}，無法下載")
+                        
+                        # 直接下載文件 URL
+                        self._log_api_request(file_url, 'GET')
+                        download_start_time = pd.Timestamp.now()
+                        
+                        async with self.session.get(file_url) as download_response:
+                            download_duration = (pd.Timestamp.now() - download_start_time).total_seconds()
+                            
+                            if download_response.status == 200:
+                                file_content = await download_response.read()
+                                self._log_api_response(file_url, download_response.status, len(file_content), download_duration)
+                                if attempt > 0:
+                                    # 使用安全的日誌記錄方式，避免 GUI 線程問題
+                                    try:
+                                        self.logger_callback('log_info', f"文件 {file_id} 重試成功")
+                                    except Exception:
+                                        print(f"文件 {file_id} 重試成功")
+                                return file_content
+                            else:
+                                response_text = await download_response.text()
+                                self._log_api_response(file_url, download_response.status, len(response_text), download_duration)
+                                
+                                # 如果是 502/503/504 等服務器錯誤，可以重試
+                                if download_response.status in [502, 503, 504] and attempt < max_retries - 1:
+                                    last_error = Exception(f"下載文件失敗: HTTP {download_response.status} - {response_text}")
+                                    continue
+                                else:
+                                    raise Exception(f"下載文件失敗: HTTP {download_response.status} - {response_text}")
+                    
+                    elif response.status == 404:
+                        raise Exception(f"文件 {file_id} 不存在")
+                    elif response.status in [502, 503, 504] and attempt < max_retries - 1:
+                        # 服務器錯誤，可以重試
+                        response_text = await response.text()
+                        last_error = Exception(f"獲取文件信息失敗: HTTP {response.status} - {response_text}")
+                        continue
+                    else:
+                        response_text = await response.text()
+                        raise Exception(f"獲取文件信息失敗: HTTP {response.status} - {response_text}")
+                        
+            except asyncio.TimeoutError:
+                last_error = Exception(f"下載文件 {file_id} 超時")
+                if attempt < max_retries - 1:
+                    # 使用安全的日誌記錄方式，避免 GUI 線程問題
+                    try:
+                        self.logger_callback('log_warning', f"文件 {file_id} 下載超時，將重試")
+                    except Exception:
+                        print(f"文件 {file_id} 下載超時，將重試")
+                    continue
+                else:
+                    break
+            except Exception as e:
+                last_error = e
+                # 對於某些錯誤，不需要重試
+                if "不存在" in str(e) or "無法下載" in str(e):
+                    break
+                elif attempt < max_retries - 1:
+                    # 使用安全的日誌記錄方式，避免 GUI 線程問題
+                    try:
+                        self.logger_callback('log_warning', f"下載文件 {file_id} 失敗: {str(e)}")
+                    except Exception:
+                        print(f"下載文件 {file_id} 失敗: {str(e)}")
+                    continue
+                else:
+                    break
+        
+        # 所有重試都失敗了
+        error_msg = str(last_error) if last_error else f"無法下載文件 {file_id}"
+        # 使用安全的日誌記錄方式，避免 GUI 線程問題
+        try:
+            self.logger_callback('log_error', f"下載文件 {file_id} 最終失敗: {error_msg}")
+        except Exception:
+            print(f"下載文件 {file_id} 最終失敗: {error_msg}")
+        raise Exception(f"無法下載文件 {file_id}: {error_msg}")
     
     async def get_knowledge_base_file_content(self, kb_id: str, file_id: str) -> Dict:
         """取得知識庫檔案內容"""
@@ -1168,13 +1507,22 @@ class EnhancedTextMatcher:
         best_match_content = ""
         
         for node in citation_nodes:
-            if 'chatbotTextNode' in node and 'content' in node['chatbotTextNode']:
+            if 'chatbotTextNode' in node and 'text' in node['chatbotTextNode']:
+                node_content = node['chatbotTextNode']['text']
+            elif 'chatbotTextNode' in node and 'content' in node['chatbotTextNode']:
                 node_content = node['chatbotTextNode']['content']
-                similarity = cls.calculate_similarity(node_content, expected_content)
+            else:
+                continue
                 
-                if similarity > best_match_score:
-                    best_match_score = similarity
-                    best_match_content = node_content
+            similarity = cls.calculate_similarity(node_content, expected_content)
+
+                
+            
+
+                
+            if similarity > best_match_score:
+                best_match_score = similarity
+                best_match_content = node_content
         
         is_hit = best_match_score >= similarity_threshold
         result_detail = f"最佳匹配分數: {best_match_score:.2f}"
@@ -1218,13 +1566,18 @@ class EnhancedTextMatcher:
         effective_top_k = top_k if top_k is not None else len(citation_nodes)
         rag_chunks = []
         for i, node in enumerate(citation_nodes[:effective_top_k]):
-            if 'chatbotTextNode' in node and 'content' in node['chatbotTextNode']:
+            if 'chatbotTextNode' in node and 'text' in node['chatbotTextNode']:
+                chunk_content = node['chatbotTextNode']['text']
+            elif 'chatbotTextNode' in node and 'content' in node['chatbotTextNode']:
                 chunk_content = node['chatbotTextNode']['content']
-                rag_chunks.append({
-                    'index': i,
-                    'content': chunk_content,
-                    'matched': False
-                })
+            else:
+                continue
+            
+            rag_chunks.append({
+                'index': i,
+                'content': chunk_content,
+                'matched': False
+            })
         
         if not rag_chunks:
             return False, {
@@ -1303,8 +1656,8 @@ class EnhancedTextMatcher:
         cited_files = []
         
         for citation in citations:
-            if 'name' in citation:
-                cited_files.append(citation['name'])
+            if 'filename' in citation:
+                cited_files.append(citation['filename'])
         
         matches = []
         for expected_file in expected_file_list:
@@ -1358,6 +1711,9 @@ class ScrollableFrame(ttk.Frame):
     
     def _bind_mousewheel(self):
         """綁定滑鼠滾輪事件（支援 Windows 和 macOS）"""
+        # 防止重複綁定的標記
+        self._mousewheel_bound = False
+        
         def _on_mousewheel(event):
             # 檢查滾動條是否可見/需要
             if self.canvas.bbox("all"):
@@ -1374,16 +1730,21 @@ class ScrollableFrame(ttk.Frame):
                         self.canvas.yview_scroll(1, "units")
         
         def _bind_to_mousewheel(event):
-            self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
-            # macOS 滾輪事件
-            self.canvas.bind_all("<Button-4>", _on_mousewheel)
-            self.canvas.bind_all("<Button-5>", _on_mousewheel)
+            # 避免重複綁定
+            if not self._mousewheel_bound:
+                self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+                # macOS 滾輪事件
+                self.canvas.bind_all("<Button-4>", _on_mousewheel)
+                self.canvas.bind_all("<Button-5>", _on_mousewheel)
+                self._mousewheel_bound = True
         
         def _unbind_from_mousewheel(event):
-            self.canvas.unbind_all("<MouseWheel>")
-            # macOS 滾輪事件
-            self.canvas.unbind_all("<Button-4>")
-            self.canvas.unbind_all("<Button-5>")
+            if self._mousewheel_bound:
+                self.canvas.unbind_all("<MouseWheel>")
+                # macOS 滾輪事件
+                self.canvas.unbind_all("<Button-4>")
+                self.canvas.unbind_all("<Button-5>")
+                self._mousewheel_bound = False
         
         # 滑鼠進入和離開時綁定/解綁滾輪事件
         self.canvas.bind('<Enter>', _bind_to_mousewheel)
@@ -1399,6 +1760,9 @@ class MaiAgentValidatorGUI:
         self.root.geometry("900x700")
         self.root.resizable(True, True)
         
+        # 修復 macOS 剪貼板和事件重複問題
+        self._setup_macos_fixes()
+        
         # 設定樣式
         self.style = ttk.Style()
         self.style.theme_use('clam')
@@ -1412,12 +1776,18 @@ class MaiAgentValidatorGUI:
         self.api_key = tk.StringVar()
         self.similarity_threshold = tk.DoubleVar(value=0.3)
         self.max_concurrent = tk.IntVar(value=5)
+        self.api_delay = tk.DoubleVar(value=1.0)  # API 呼叫間隔延遲時間（秒）
+        self.max_retries = tk.IntVar(value=3)  # API 請求重試次數
         # 固定使用 RAG 模式，不再提供開關
         self.top_k = None  # 動態：根據 API 回傳的引用節點數量決定
         self.selected_chatbot_id = None
         self.validation_data = []
         self.conversation_manager = ConversationManager()
         self.text_matcher = EnhancedTextMatcher()
+        
+        # 驗證控制變數
+        self.validation_stopped = False
+        self.completed_questions = 0
         
         # 段落分隔符設定
         self.separator_vars = {
@@ -1456,32 +1826,136 @@ class MaiAgentValidatorGUI:
         self.api_logger = logging.getLogger(f"{__name__}.API")
         self.validation_logger = logging.getLogger(f"{__name__}.Validation")
         
+        # GUI 運行狀態標誌
+        self.gui_running = True
+        self._in_logger_callback = False
+        self._in_log_message = False
+        
+        # 日誌限流機制 - 更嚴格的控制
+        self._log_queue_size = 0
+        self._max_concurrent_logs = 2  # 降低到2個並發
+        self._last_log_time = 0
+        self._log_throttle_active = False
+        self._emergency_throttle = False  # 緊急限流標誌
+        self._consecutive_errors = 0  # 連續錯誤計數
+        
+        # 簡化日誌函數（緊急使用）
+        self._emergency_log = lambda msg: print(f"[EMERGENCY] {msg}") if hasattr(self, '_emergency_throttle') and self._emergency_throttle else None
+        
+        # 靜默模式 - 完全禁用GUI日誌更新
+        self._silent_mode = False
+        self._simple_console_log = lambda msg: print(f"[SIMPLE] {msg}")
+        self._download_in_progress = False
+        
         self.create_widgets()
         
         # 記錄啟動日誌
         self.log_info(f"{__app_name__} v{__version__} 已啟動")
         self.log_info(f"日誌系統已初始化，日誌目錄: {Path('logs').absolute()}")
     
+    def _setup_macos_fixes(self):
+        """設定 macOS 特定的修復"""
+        if platform.system() == 'Darwin':  # macOS
+            # 設定剪貼板更新間隔
+            self.root.after(100, self._periodic_clipboard_update)
+            
+            # 修復文本組件的重複輸入問題
+            self.root.option_add('*Text.highlightThickness', 1)
+            
+    def _periodic_clipboard_update(self):
+        """定期更新剪貼板狀態以防止重複（線程安全）"""
+        if not self.gui_running:
+            return
+            
+        try:
+            # 定期清理剪貼板狀態，但只在 GUI 運行時
+            if self.gui_running:
+                self.root.after(1000, self._periodic_clipboard_update)
+        except:
+            pass
+    
     def api_logger_callback(self, method_name, *args, **kwargs):
-        """API日誌回調函數 - 增強版本"""
-        if method_name == 'log_api_request' and len(args) >= 2:
-            url, method = args[0], args[1]
-            payload = args[2] if len(args) > 2 else None
-            self.log_api_request(url, method, payload)
-        elif method_name == 'log_api_response' and len(args) >= 2:
-            url, status_code = args[0], args[1]
-            response_size = args[2] if len(args) > 2 else 0
-            duration = args[3] if len(args) > 3 else None
-            self.log_api_response(url, status_code, response_size, duration)
-        elif method_name == 'log_info' and len(args) >= 1:
-            message = args[0]
-            logger_name = args[1] if len(args) > 1 else 'API'
-            self.log_info(message, logger_name)
-        elif method_name == 'log_error' and len(args) >= 1:
-            message = args[0]
-            logger_name = args[1] if len(args) > 1 else 'API'
-            self.log_error(message, logger_name)
+        """API日誌回調函數 - 完全禁用版本（防止所有遞歸錯誤）"""
         
+        # 完全禁用API日誌回調處理 - 防止任何遞歸可能性
+        return
+        
+        # 下載期間靜默模式 - 完全禁用API日誌處理
+        if getattr(self, '_download_in_progress', False):
+            # 完全跳過API日誌處理，避免任何GUI更新
+            return
+        
+        # 防止遞歸調用和 GUI 關閉後的調用
+        if not getattr(self, 'gui_running', True):
+            return
+            
+        # 添加遞歸保護
+        if getattr(self, '_in_logger_callback', False):
+            return
+            
+        # 增強緊急限流檢查
+        if getattr(self, '_emergency_throttle', False):
+            return
+            
+        # 日誌限流 - API日誌激進限制
+        if getattr(self, '_log_queue_size', 0) > 0:  # API日誌不允許任何並發
+            return
+            
+        # 添加調用深度檢查
+        try:
+            frame_count = len([frame for frame in __import__('inspect').stack()])
+            if frame_count > 30:  # 降低閾值，更早返回
+                return
+        except:
+            # 如果檢查失敗，返回而不是繼續
+            return
+            
+        try:
+            self._in_logger_callback = True
+            
+            if method_name == 'log_api_request' and len(args) >= 2:
+                url, method = args[0], args[1]
+                payload = args[2] if len(args) > 2 else None
+                try:
+                    self.log_api_request(url, method, payload)
+                except:
+                    # 如果日誌失敗，直接打印
+                    print(f"API請求: {method} {url}")
+            elif method_name == 'log_api_response' and len(args) >= 2:
+                url, status_code = args[0], args[1]
+                response_size = args[2] if len(args) > 2 else 0
+                duration = args[3] if len(args) > 3 else None
+                try:
+                    self.log_api_response(url, status_code, response_size, duration)
+                except:
+                    # 如果日誌失敗，直接打印
+                    print(f"API回應: {url} | 狀態碼: {status_code}")
+            elif method_name == 'log_info' and len(args) >= 1:
+                message = args[0]
+                logger_name = args[1] if len(args) > 1 else 'API'
+                try:
+                    self.log_info(message, logger_name)
+                except:
+                    # 如果日誌失敗，直接打印
+                    print(f"INFO: {message}")
+            elif method_name == 'log_error' and len(args) >= 1:
+                message = args[0]
+                logger_name = args[1] if len(args) > 1 else 'API'
+                try:
+                    self.log_error(message, logger_name)
+                except:
+                    # 如果日誌失敗，直接打印
+                    print(f"ERROR: {message}")
+        except Exception as e:
+            # 完全靜默的錯誤處理，避免任何可能的遞歸調用
+            # 只有在開發模式下才打印
+            try:
+                print(f"Logger callback silent error: {type(e).__name__}")
+            except:
+                pass
+        finally:
+            self._in_logger_callback = False
+    
     def create_widgets(self):
         """創建 GUI 組件"""
         # 創建筆記本標籤頁
@@ -1520,7 +1994,7 @@ class MaiAgentValidatorGUI:
         file_frame = ttk.LabelFrame(padding_frame, text="測試文件", padding=10)
         file_frame.pack(fill='x', pady=(0, 10))
         
-        ttk.Label(file_frame, text="CSV 文件路徑：").pack(anchor='w')
+        ttk.Label(file_frame, text="測試文件路徑 (CSV/Excel)：").pack(anchor='w')
         file_path_frame = ttk.Frame(file_frame)
         file_path_frame.pack(fill='x', pady=(5, 0))
         
@@ -1549,11 +2023,33 @@ class MaiAgentValidatorGUI:
         threshold_label.pack(anchor='w')
         self.similarity_threshold.trace_add('write', lambda *args: threshold_label.config(text=f"當前值: {self.similarity_threshold.get():.2f}"))
         
-        ttk.Label(param_frame, text="最大並發請求數：").pack(anchor='w')
+        ttk.Label(param_frame, text="最大並發提問者數：").pack(anchor='w')
         ttk.Scale(param_frame, from_=1, to=20, variable=self.max_concurrent, orient='horizontal').pack(fill='x', pady=(5, 5))
         concurrent_label = ttk.Label(param_frame, text="")
         concurrent_label.pack(anchor='w')
         self.max_concurrent.trace_add('write', lambda *args: concurrent_label.config(text=f"當前值: {self.max_concurrent.get()}"))
+        
+        ttk.Label(param_frame, text="API 呼叫延遲時間 (秒)：").pack(anchor='w', pady=(10, 0))
+        ttk.Scale(param_frame, from_=0.0, to=5.0, variable=self.api_delay, orient='horizontal').pack(fill='x', pady=(5, 5))
+        delay_label = ttk.Label(param_frame, text="")
+        delay_label.pack(anchor='w')
+        self.api_delay.trace_add('write', lambda *args: delay_label.config(text=f"當前值: {self.api_delay.get():.1f} 秒"))
+        
+        # 添加說明文字
+        delay_help = ttk.Label(param_frame, text="  ↳ 連續 API 呼叫之間的延遲時間，有助於避免限流", 
+                              font=('Arial', 8), foreground='gray')
+        delay_help.pack(anchor='w')
+        
+        ttk.Label(param_frame, text="API 請求重試次數：").pack(anchor='w', pady=(10, 0))
+        ttk.Scale(param_frame, from_=1, to=10, variable=self.max_retries, orient='horizontal').pack(fill='x', pady=(5, 5))
+        retries_label = ttk.Label(param_frame, text="")
+        retries_label.pack(anchor='w')
+        self.max_retries.trace_add('write', lambda *args: retries_label.config(text=f"當前值: {self.max_retries.get()} 次"))
+        
+        # 添加說明文字
+        retries_help = ttk.Label(param_frame, text="  ↳ 遇到網路錯誤時的重試次數，有助於處理臨時連接問題", 
+                               font=('Arial', 8), foreground='gray')
+        retries_help.pack(anchor='w')
         
         # 段落分隔符選擇
         separator_frame = ttk.LabelFrame(padding_frame, text="段落分隔符設定", padding=10)
@@ -1754,10 +2250,15 @@ class MaiAgentValidatorGUI:
         scrollbar.pack(side='right', fill='y')
 
     def browse_csv_file(self):
-        """瀏覽選擇 CSV 文件"""
+        """瀏覽選擇 CSV 或 Excel 文件"""
         filename = filedialog.askopenfilename(
-            title="選擇 CSV 測試文件",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            title="選擇測試文件 (CSV 或 Excel)",
+            filetypes=[
+                ("支援的文件", "*.csv *.xlsx *.xls"), 
+                ("CSV files", "*.csv"), 
+                ("Excel files", "*.xlsx *.xls"),
+                ("All files", "*.*")
+            ]
         )
         if filename:
             self.csv_file_path.set(filename)
@@ -1774,7 +2275,7 @@ class MaiAgentValidatorGUI:
                 asyncio.set_event_loop(loop)
                 
                 async def test():
-                    async with MaiAgentApiClient(self.api_base_url.get(), self.api_key.get(), self.api_logger_callback) as client:
+                    async with MaiAgentApiClient(self.api_base_url.get(), self.api_key.get(), None) as client:
                         chatbots = await client.get_chatbots()
                         return len(chatbots)
                 
@@ -1784,7 +2285,8 @@ class MaiAgentValidatorGUI:
                 self.root.after(0, lambda: messagebox.showinfo("成功", f"連接成功！找到 {count} 個聊天機器人"))
                 
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("錯誤", f"連接失敗：{str(e)}"))
+                error_msg = str(e)
+                self.root.after(0, lambda: messagebox.showerror("錯誤", f"連接失敗：{error_msg}"))
         
         threading.Thread(target=test_async, daemon=True).start()
         
@@ -1800,7 +2302,7 @@ class MaiAgentValidatorGUI:
                 asyncio.set_event_loop(loop)
                 
                 async def fetch():
-                    async with MaiAgentApiClient(self.api_base_url.get(), self.api_key.get(), self.api_logger_callback) as client:
+                    async with MaiAgentApiClient(self.api_base_url.get(), self.api_key.get(), None) as client:
                         return await client.get_chatbots()
                 
                 chatbots = loop.run_until_complete(fetch())
@@ -1810,7 +2312,8 @@ class MaiAgentValidatorGUI:
                 self.root.after(0, lambda: self.update_chatbot_list(chatbots))
                 
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("錯誤", f"載入失敗：{str(e)}"))
+                error_msg = str(e)
+                self.root.after(0, lambda: messagebox.showerror("錯誤", f"載入失敗：{error_msg}"))
         
         threading.Thread(target=refresh_async, daemon=True).start()
         
@@ -1826,7 +2329,7 @@ class MaiAgentValidatorGUI:
         """開始驗證"""
         # 檢查設定
         if not self.csv_file_path.get():
-            messagebox.showerror("錯誤", "請選擇 CSV 文件")
+            messagebox.showerror("錯誤", "請選擇測試文件 (CSV 或 Excel)")
             return
             
         if not self.api_key.get():
@@ -1839,6 +2342,10 @@ class MaiAgentValidatorGUI:
             return
             
         self.selected_chatbot_id = self.chatbots[selection[0]]['id']
+        
+        # 重設停止標志和進度計數器
+        self.validation_stopped = False
+        self.completed_questions = 0
         
         # 更新 UI 狀態
         self.start_button.config(state='disabled')
@@ -1856,10 +2363,10 @@ class MaiAgentValidatorGUI:
         
     def stop_validation(self):
         """停止驗證"""
-        # 這裡可以實現停止邏輯
+        self.validation_stopped = True
         self.start_button.config(state='normal')
         self.stop_button.config(state='disabled')
-        self.log_warning("驗證已停止")
+        self.log_warning("正在停止驗證，請稍候...")
         
     def run_validation(self):
         """執行驗證（在背景執行緒中）"""
@@ -1868,7 +2375,7 @@ class MaiAgentValidatorGUI:
             asyncio.set_event_loop(loop)
             
             # 載入數據
-            self.log_info("正在載入 CSV 數據...")
+            self.log_info("正在載入測試數據...")
             validation_data = self.load_csv_data()
             
             total_questions = len(validation_data)
@@ -1886,7 +2393,7 @@ class MaiAgentValidatorGUI:
             stats = self.calculate_statistics(results)
             
             # 輸出結果
-            output_file = f"validation_results_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            output_file = f"validation_results_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             self.log_info(f"匯出結果到: {output_file}")
             self.export_results(results, output_file, stats)
             
@@ -1895,67 +2402,203 @@ class MaiAgentValidatorGUI:
             self.root.after(0, lambda: self.show_results(results, stats, output_file))
             
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("錯誤", f"驗證過程發生錯誤：{str(e)}"))
+            error_msg = str(e)
+            self.root.after(0, lambda: messagebox.showerror("錯誤", f"驗證過程發生錯誤：{error_msg}"))
         finally:
+            # 檢查是否是正常完成還是被停止
+            if self.validation_stopped:
+                self.root.after(0, lambda: self.log_warning("驗證已停止"))
             # 重設 UI 狀態
             self.root.after(0, lambda: self.reset_validation_ui())
             
     def load_csv_data(self):
-        """載入 CSV 數據"""
-        df = pd.read_csv(self.csv_file_path.get(), encoding='utf-8')
+        """載入 CSV 或 Excel 數據"""
+        file_path = self.csv_file_path.get()
+        file_extension = os.path.splitext(file_path)[1].lower()
         
-        validation_rows = []
-        for _, row in df.iterrows():
-            validation_row = ValidationRow(
-                編號=str(row['編號']),
-                提問者=str(row['提問者']),
-                問題描述=str(row['問題描述']),
-                建議_or_正確答案=str(row.get('建議 or 正確答案 (if have)', '')),
-                應參考的文件=str(row.get('應參考的文件', '')),
-                應參考的文件段落=str(row.get('應參考的文件段落', ''))
-            )
-            validation_rows.append(validation_row)
+        try:
+            # 根據文件擴展名選擇適當的讀取方法
+            if file_extension == '.csv':
+                df = pd.read_csv(file_path, encoding='utf-8')
+            elif file_extension in ['.xlsx', '.xls']:
+                df = pd.read_excel(file_path, engine='openpyxl' if file_extension == '.xlsx' else None)
+            else:
+                raise ValueError(f"不支援的文件格式: {file_extension}")
             
-        return validation_rows
+            # 檢查必要的欄位 - 支援多種欄位名稱
+            required_columns = ['編號', '提問者']
+            actual_columns = list(df.columns)
+            missing_columns = [col for col in required_columns if col not in actual_columns]
+            
+            # 檢查問題內容欄位（支援多種名稱）
+            question_column = None
+            for possible_name in ['問題描述', '對話內容', '問題內容', '內容']:
+                if possible_name in actual_columns:
+                    question_column = possible_name
+                    break
+            
+            if not question_column:
+                missing_columns.append('問題描述/對話內容')
+            
+            if missing_columns:
+                self.log_error(f"文件缺少必要欄位: {', '.join(missing_columns)}")
+                self.log_error(f"實際欄位: {', '.join(actual_columns)}")
+                raise ValueError(f"文件缺少必要欄位: {', '.join(missing_columns)}\\n\\n實際欄位: {', '.join(actual_columns)}\\n\\n請確保文件包含以下欄位：編號、提問者、問題描述/對話內容")
+            
+            self.log_info(f"成功載入文件，共 {len(df)} 行數據")
+            self.log_info(f"使用 '{question_column}' 作為問題內容欄位")
+            self.log_info(f"文件欄位: {', '.join(actual_columns)}")
+            
+            validation_rows = []
+            for _, row in df.iterrows():
+                validation_row = ValidationRow(
+                    編號=str(row['編號']),
+                    提問者=str(row['提問者']),
+                    問題描述=str(row[question_column]),  # 使用動態檢測到的欄位名稱
+                    建議_or_正確答案=str(row.get('建議 or 正確答案 (if have)', '')),
+                    應參考的文件=str(row.get('應參考的文件', '')),
+                    應參考的文件段落=str(row.get('應參考的文件段落', ''))
+                )
+                validation_rows.append(validation_row)
+                
+            return validation_rows
+            
+        except Exception as e:
+            self.log_error(f"載入文件失敗: {str(e)}")
+            raise
         
     async def process_validation(self, validation_data):
-        """處理驗證"""
-        results = []
+        """處理驗證 - 支援併發處理多個提問者"""
+        # 按提問者分組
+        user_groups = {}
+        for row in validation_data:
+            user = row.提問者
+            if user not in user_groups:
+                user_groups[user] = []
+            user_groups[user].append(row)
         
-        async with MaiAgentApiClient(self.api_base_url.get(), self.api_key.get(), self.api_logger_callback) as client:
-            for i, row in enumerate(validation_data):
-                try:
-                    # 更新進度
-                    self.root.after(0, lambda: self.update_progress(i, len(validation_data), f"處理問題 {row.編號}"))
-                    
-                    # 處理單個問題
-                    result = await self.process_single_question(client, row)
-                    results.append(result)
-                    
-                    self.log_validation_result(row.編號, True, f"回覆長度: {len(result.AI助理回覆)} 字元")
-                    
-                except Exception as e:
-                    self.log_error(f"處理問題 {row.編號} 時發生錯誤: {str(e)}", 'Validation')
-                    row.AI助理回覆 = f"錯誤: {str(e)}"
-                    results.append(row)
+        self.log_info(f"發現 {len(user_groups)} 個不同的提問者")
+        self.log_info(f"提問者列表: {', '.join(user_groups.keys())}")
+        max_concurrent_users = self.max_concurrent.get()
+        self.log_info(f"開始併發處理，最多同時處理 {max_concurrent_users} 個提問者")
+        
+        # 創建進度追蹤鎖
+        progress_lock = asyncio.Lock()
+        
+        # 創建結果字典，用於快速查找
+        results_dict = {}
+        
+        async with MaiAgentApiClient(self.api_base_url.get(), self.api_key.get(), None) as client:
+            # 使用 Semaphore 控制併發數量
+            semaphore = asyncio.Semaphore(max_concurrent_users)
+            
+            # 創建每個提問者的處理任務
+            tasks = []
+            for user, user_questions in user_groups.items():
+                task = self.process_user_questions(client, user, user_questions, semaphore, len(validation_data), progress_lock, results_dict)
+                tasks.append(task)
+            
+            # 併發執行所有提問者的任務
+            await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # 按原始順序整理結果
+        results = []
+        for row in validation_data:
+            if row.編號 in results_dict:
+                results.append(results_dict[row.編號])
+            else:
+                # 如果沒找到結果（可能因為停止或錯誤），使用原始數據並添加必要屬性
+                row.AI助理回覆 = "未處理"
+                
+                # 確保未處理的 row 具有所有統計屬性
+                row.precision = 0.0
+                row.recall = 0.0
+                row.f1_score = 0.0
+                row.hit_rate = 0.0
+                row.引用節點是否命中 = "否"
+                row.參考文件是否正確 = "否"
+                row.回覆是否滿意 = "否"
+                
+                results.append(row)
                     
         return results
+    
+    async def process_user_questions(self, client, user, user_questions, semaphore, total_questions, progress_lock, results_dict):
+        """處理單個提問者的所有問題"""
+        async with semaphore:  # 控制併發數量
+            self.log_info(f"開始處理提問者 '{user}' 的 {len(user_questions)} 個問題")
+            
+            for i, row in enumerate(user_questions):
+                # 檢查是否需要停止
+                if self.validation_stopped:
+                    self.log_warning(f"提問者 '{user}' 的處理已停止")
+                    break
+                
+                try:
+                    # 處理單個問題
+                    result = await self.process_single_question(client, row)
+                    
+                    # 線程安全地更新結果和進度
+                    async with progress_lock:
+                        results_dict[row.編號] = result
+                        self.completed_questions += 1
+                        
+                        # 更新進度顯示
+                        progress_msg = f"[{user}] 完成問題 {row.編號} | 總進度 {self.completed_questions}/{total_questions}"
+                        self.root.after(0, lambda msg=progress_msg: self.update_progress(self.completed_questions, total_questions, msg))
+                    
+                    # 記錄成功
+                    self.log_validation_result(row.編號, True, f"[{user}] 回覆長度: {len(result.AI助理回覆)} 字元")
+                    
+                except Exception as e:
+                    self.log_error(f"處理提問者 '{user}' 的問題 {row.編號} 時發生錯誤: {str(e)}", 'Validation')
+                    # 即使出錯也要更新進度，並確保 row 具有所有必要的屬性
+                    async with progress_lock:
+                        row.AI助理回覆 = f"錯誤: {str(e)}"
+                        
+                        # 確保錯誤的 row 具有所有統計屬性
+                        row.precision = 0.0
+                        row.recall = 0.0
+                        row.f1_score = 0.0
+                        row.hit_rate = 0.0
+                        row.引用節點是否命中 = "否"
+                        row.參考文件是否正確 = "否"
+                        row.回覆是否滿意 = "否"
+                        
+                        results_dict[row.編號] = row
+                        self.completed_questions += 1
+                        
+                        progress_msg = f"[{user}] 處理問題 {row.編號} (錯誤) | 總進度 {self.completed_questions}/{total_questions}"
+                        self.root.after(0, lambda msg=progress_msg: self.update_progress(self.completed_questions, total_questions, msg))
+            
+            self.log_info(f"提問者 '{user}' 處理完成")
         
     async def process_single_question(self, client, validation_row):
         """處理單個問題"""
         # 獲取或創建對話
         conversation_id = self.conversation_manager.get_conversation_id(validation_row.提問者)
         
-        # 發送問題
-        response = await client.send_message(self.selected_chatbot_id, validation_row.問題描述, conversation_id)
+        # 發送問題（使用重試機制）
+        response = await client.send_message(
+            self.selected_chatbot_id, 
+            validation_row.問題描述, 
+            conversation_id,
+            max_retries=self.max_retries.get()
+        )
         
         # 更新對話 ID
         self.conversation_manager.set_conversation_id(validation_row.提問者, response.conversation_id)
         
         # 填入回覆結果
         validation_row.AI助理回覆 = response.content
-        validation_row.引用節點 = json.dumps(response.citation_nodes, ensure_ascii=False)
-        validation_row.參考文件 = json.dumps(response.citations, ensure_ascii=False)
+        validation_row._raw_citation_nodes = response.citation_nodes
+        validation_row._raw_citations = response.citations
+        
+        # 動態添加引用節點欄位
+        self._add_citation_node_fields(validation_row, response.citation_nodes)
+        
+        # 動態添加參考文件欄位
+        self._add_citation_file_fields(validation_row, response.citations)
         
         # 進行文字比對驗證（固定使用 RAG 增強模式）
         # 動態根據實際回傳的引用節點數量決定片段數
@@ -1990,27 +2633,77 @@ class MaiAgentValidatorGUI:
             validation_row.回覆是否滿意 = "部分滿意"
         else:
             validation_row.回覆是否滿意 = "否"
-            
-        return validation_row
         
+        # API 呼叫延遲（避免觸發限流）
+        delay_time = self.api_delay.get()
+        if delay_time > 0:
+            await asyncio.sleep(delay_time)
+                        
+        return validation_row
+
+    def _add_citation_node_fields(self, validation_row, citation_nodes):
+        """動態添加引用節點欄位"""
+        for i, node in enumerate(citation_nodes, 1):
+            chinese_num = self.get_chinese_number(i)
+            field_name = f'引用節點{chinese_num}'
+            
+            # 提取節點文本內容
+            content = ""
+            if 'chatbotTextNode' in node and 'text' in node['chatbotTextNode']:
+                content = node['chatbotTextNode']['text']
+            elif 'content' in node.get('chatbotTextNode', {}):
+                content = node['chatbotTextNode']['content']
+            elif 'text' in node:
+                content = node['text']
+            
+            # 動態添加到 validation_row 物件
+            setattr(validation_row, field_name, content)
+
+    def _add_citation_file_fields(self, validation_row, citations):
+        """動態添加參考文件欄位"""
+        # 收集所有文件信息
+        file_info_list = []
+        
+        for citation in citations:
+            filename = citation.get('filename', '未知文件')
+            labels = citation.get('labels', [])
+            
+            # 組合文件名和標籤
+            if labels:
+                label_names = [label.get('name', '') for label in labels if label.get('name')]
+                if label_names:
+                    file_info = f"{filename} (標籤: {', '.join(label_names)})"
+                else:
+                    file_info = filename
+            else:
+                file_info = filename
+            
+            file_info_list.append(file_info)
+        
+        # 為每個文件添加獨立欄位
+        for i, file_info in enumerate(file_info_list, 1):
+            chinese_num = self.get_chinese_number(i)
+            field_name = f'參考文件{chinese_num}'
+            setattr(validation_row, field_name, file_info)
+
     def calculate_statistics(self, results):
         """計算增強統計結果"""
         total_queries = len(results)
         if total_queries == 0:
-                    return {
-            'total_queries': 0, 
-            'citation_hit_rate': 0.0, 
-            'file_match_rate': 0.0, 
-            'top_10_hit_rate': 0.0,
-            'avg_precision': 0.0,
-            'avg_recall': 0.0,
-            'avg_f1_score': 0.0,
-            'avg_hit_rate': 0.0,
-            'total_expected_segments': 0,
-            'total_hit_segments': 0,
-            'total_retrieved_chunks': 0,
-            'total_relevant_chunks': 0
-        }
+            return {
+                'total_queries': 0, 
+                'citation_hit_rate': 0.0, 
+                'file_match_rate': 0.0, 
+                'top_10_hit_rate': 0.0,
+                'avg_precision': 0.0,
+                'avg_recall': 0.0,
+                'avg_f1_score': 0.0,
+                'avg_hit_rate': 0.0,
+                'total_expected_segments': 0,
+                'total_hit_segments': 0,
+                'total_retrieved_chunks': 0,
+                'total_relevant_chunks': 0
+            }
         
         # 基本統計
         citation_hits = sum(1 for row in results if row.引用節點是否命中 == "是")
@@ -2058,7 +2751,7 @@ class MaiAgentValidatorGUI:
         }
         
     def export_results(self, results, output_file, stats):
-        """輸出結果到 CSV（包含分割的段落欄位）"""
+        """輸出結果到 Excel（包含分割的段落欄位和動態引用節點/參考文件欄位）"""
         selected_separators = self.get_selected_separators()
         output_data = []
         
@@ -2068,7 +2761,34 @@ class MaiAgentValidatorGUI:
             segments = self.split_segments_for_export(row.應參考的文件段落, selected_separators)
             max_segments = max(max_segments, len(segments))
         
-        self.log_info(f"檢測到最大段落數量: {max_segments}，將創建對應的欄位")
+        # 分析所有行，找出最大引用節點和參考文件數量
+        max_citation_nodes = 0
+        max_citation_files = 0
+        
+        for row in results:
+            # 計算引用節點數量
+            citation_count = 0
+            for i in range(1, 20):  # 假設最多不會超過20個
+                chinese_num = self.get_chinese_number(i)
+                field_name = f'引用節點{chinese_num}'
+                if hasattr(row, field_name):
+                    citation_count = i
+                else:
+                    break
+            max_citation_nodes = max(max_citation_nodes, citation_count)
+            
+            # 計算參考文件數量
+            file_count = 0
+            for i in range(1, 20):  # 假設最多不會超過20個
+                chinese_num = self.get_chinese_number(i)
+                field_name = f'參考文件{chinese_num}'
+                if hasattr(row, field_name):
+                    file_count = i
+                else:
+                    break
+            max_citation_files = max(max_citation_files, file_count)
+        
+        self.log_info(f"檢測到最大段落數量: {max_segments}，引用節點數量: {max_citation_nodes}，參考文件數量: {max_citation_files}")
         
         for row in results:
             # 基本欄位
@@ -2077,8 +2797,6 @@ class MaiAgentValidatorGUI:
                 '提問者': row.提問者,
                 '問題描述': row.問題描述,
                 'AI 助理回覆': row.AI助理回覆,
-                '引用節點': row.引用節點,
-                '參考文件': row.參考文件,
                 '建議 or 正確答案 (if have)': row.建議_or_正確答案,
                 '應參考的文件': row.應參考的文件,
                 '應參考的文件段落(原始)': row.應參考的文件段落,  # 保留原始完整內容
@@ -2086,6 +2804,20 @@ class MaiAgentValidatorGUI:
                 '參考文件是否正確': row.參考文件是否正確,
                 '回覆是否滿意': row.回覆是否滿意
             }
+            
+            # 添加動態引用節點欄位
+            for i in range(1, max_citation_nodes + 1):
+                chinese_num = self.get_chinese_number(i)
+                field_name = f'引用節點{chinese_num}'
+                content = getattr(row, field_name, '') if hasattr(row, field_name) else ''
+                row_data[field_name] = content
+            
+            # 添加動態參考文件欄位
+            for i in range(1, max_citation_files + 1):
+                chinese_num = self.get_chinese_number(i)
+                field_name = f'參考文件{chinese_num}'
+                content = getattr(row, field_name, '') if hasattr(row, field_name) else ''
+                row_data[field_name] = content
             
             # 分割段落並添加到獨立欄位
             segments = self.split_segments_for_export(row.應參考的文件段落, selected_separators)
@@ -2102,7 +2834,7 @@ class MaiAgentValidatorGUI:
             output_data.append(row_data)
         
         df = pd.DataFrame(output_data)
-        df.to_csv(output_file, index=False, encoding='utf-8-sig')
+        df.to_excel(output_file, index=False, engine='openpyxl')
         self.output_file = output_file
         
         # 記錄分割統計
@@ -2177,73 +2909,164 @@ TOP 10 Hit Rate: {stats['top_10_hit_rate']:.2f}%
         self.progress_label.config(text=f"{message} ({current}/{total})")
         
     def log_message(self, message, level='INFO', logger_name='GUI'):
-        """增強版日誌記錄方法"""
-        # 選擇對應的日誌記錄器
-        if logger_name == 'API':
-            log_instance = self.api_logger
-        elif logger_name == 'Validation':
-            log_instance = self.validation_logger
-        else:
-            log_instance = self.gui_logger
+        """超強化日誌記錄方法（完全安全版本 - 最大化遞歸保護）"""
         
-        # 根據級別記錄到文件
-        timestamp = pd.Timestamp.now().strftime('%H:%M:%S')
-        formatted_message = f"[{timestamp}] {message}"
+        # 完全安全模式 - 在下載期間禁用所有日誌處理
+        if getattr(self, '_download_in_progress', False):
+            # 只使用最簡單的控制台輸出，避免任何複雜處理
+            if level == 'ERROR':
+                print(f"[SAFE-ERROR] {message}")
+            return
         
-        if level.upper() == 'DEBUG':
-            log_instance.debug(message)
-        elif level.upper() == 'INFO':
-            log_instance.info(message)
-        elif level.upper() == 'WARNING':
-            log_instance.warning(message)
-        elif level.upper() == 'ERROR':
-            log_instance.error(message)
-        elif level.upper() == 'CRITICAL':
-            log_instance.critical(message)
+        # 緊急保護 - 如果程序不穩定，立即停止日誌處理
+        if getattr(self, '_emergency_throttle', False):
+            return
         
-        # 更新 GUI 顯示
-        def update_log():
-            try:
-                self.log_text.config(state='normal')
-                
-                # 根據日誌級別設定顏色標籤
-                color_tag = level.lower()
-                
-                # 安全地檢查標籤是否存在並配置顏色
+        # 緊急限流 - 如果連續錯誤過多，直接禁用日誌
+        if getattr(self, '_emergency_throttle', False):
+            return
+            
+        # 防止遞歸調用和 GUI 關閉後的調用
+        if not getattr(self, 'gui_running', True):
+            return
+            
+        # 添加遞歸保護
+        if getattr(self, '_in_log_message', False):
+            # 連續錯誤計數
+            self._consecutive_errors = getattr(self, '_consecutive_errors', 0) + 1
+            if self._consecutive_errors > 5:
+                self._emergency_throttle = True
+            return
+            
+        # 激進的調用棧檢查
+        try:
+            import sys
+            if len(sys._current_frames()) > 20:  # 如果有太多活躍線程
+                return
+        except:
+            return
+            
+        # 日誌限流機制 - 更嚴格的控制
+        import time
+        current_time = time.time()
+        
+        # 檢查是否需要限流（更嚴格）
+        if getattr(self, '_log_queue_size', 0) > getattr(self, '_max_concurrent_logs', 2):
+            return  # 跳過此日誌，防止遞歸
+        
+        # 檢查時間間隔限流（更嚴格）
+        if current_time - getattr(self, '_last_log_time', 0) < 0.05:  # 50ms 間隔
+            return  # 跳過此日誌
+        
+        # 對API日誌進行特殊限制
+        if logger_name == 'API' and getattr(self, '_log_queue_size', 0) > 1:
+            return  # API日誌只允許1個並發
+        
+        try:
+            self._in_log_message = True
+            self._log_queue_size = getattr(self, '_log_queue_size', 0) + 1
+            self._last_log_time = current_time
+            
+            # 重置連續錯誤計數
+            self._consecutive_errors = 0
+            
+            # 選擇對應的日誌記錄器
+            if logger_name == 'API':
+                log_instance = self.api_logger
+            elif logger_name == 'Validation':
+                log_instance = self.validation_logger
+            else:
+                log_instance = self.gui_logger
+            
+            # 根據級別記錄到文件
+            timestamp = pd.Timestamp.now().strftime('%H:%M:%S')
+            formatted_message = f"[{timestamp}] {message}"
+            
+            if level.upper() == 'DEBUG':
+                log_instance.debug(message)
+            elif level.upper() == 'INFO':
+                log_instance.info(message)
+            elif level.upper() == 'WARNING':
+                log_instance.warning(message)
+            elif level.upper() == 'ERROR':
+                log_instance.error(message)
+            elif level.upper() == 'CRITICAL':
+                log_instance.critical(message)
+            
+            # 更新 GUI 顯示（線程安全）
+            def update_log():
+                if not self.gui_running:
+                    return
+                    
                 try:
-                    # 嘗試獲取標籤配置，如果不存在會拋出異常
-                    existing_color = self.log_text.tag_cget(color_tag, 'foreground')
-                    if not existing_color:
-                        raise Exception("標籤未配置顏色")
-                except:
-                    # 標籤不存在或未配置，創建新標籤
-                    if level.upper() == 'ERROR' or level.upper() == 'CRITICAL':
-                        self.log_text.tag_config(color_tag, foreground='red')
-                    elif level.upper() == 'WARNING':
-                        self.log_text.tag_config(color_tag, foreground='orange')
-                    elif level.upper() == 'DEBUG':
-                        self.log_text.tag_config(color_tag, foreground='gray')
-                    else:
-                        self.log_text.tag_config(color_tag, foreground='black')
-                
-                # 插入帶顏色的文字
-                start_pos = self.log_text.index(tk.END + "-1c")
-                self.log_text.insert(tk.END, f"{formatted_message}\n")
-                end_pos = self.log_text.index(tk.END + "-1c")
-                self.log_text.tag_add(color_tag, start_pos, end_pos)
-                
-                # 限制日誌顯示行數（避免過多日誌影響效能）
-                line_count = int(self.log_text.index('end-1c').split('.')[0])
-                if line_count > 1000:
-                    self.log_text.delete('1.0', '500.0')
-                
-                self.log_text.see(tk.END)
-                self.log_text.config(state='disabled')
-            except Exception as e:
-                # 防止日誌記錄本身出錯
-                print(f"日誌更新失敗: {e}")
-                
-        self.root.after(0, update_log)
+                    if not hasattr(self, 'log_text') or not self.log_text.winfo_exists():
+                        return
+                        
+                    self.log_text.config(state='normal')
+                    
+                    # 根據日誌級別設定顏色標籤
+                    color_tag = level.lower()
+                    
+                    # 安全地檢查標籤是否存在並配置顏色
+                    try:
+                        # 嘗試獲取標籤配置，如果不存在會拋出異常
+                        existing_color = self.log_text.tag_cget(color_tag, 'foreground')
+                        if not existing_color:
+                            raise Exception("標籤未配置顏色")
+                    except:
+                        # 標籤不存在或未配置，創建新標籤
+                        if level.upper() == 'ERROR' or level.upper() == 'CRITICAL':
+                            self.log_text.tag_config(color_tag, foreground='red')
+                        elif level.upper() == 'WARNING':
+                            self.log_text.tag_config(color_tag, foreground='orange')
+                        elif level.upper() == 'DEBUG':
+                            self.log_text.tag_config(color_tag, foreground='gray')
+                        else:
+                            self.log_text.tag_config(color_tag, foreground='black')
+                    
+                    # 插入帶顏色的文字
+                    start_pos = self.log_text.index(tk.END + "-1c")
+                    self.log_text.insert(tk.END, f"{formatted_message}\n")
+                    end_pos = self.log_text.index(tk.END + "-1c")
+                    self.log_text.tag_add(color_tag, start_pos, end_pos)
+                    
+                    # 限制日誌顯示行數（避免過多日誌影響效能）
+                    line_count = int(self.log_text.index('end-1c').split('.')[0])
+                    if line_count > 1000:
+                        self.log_text.delete('1.0', '500.0')
+                    
+                    self.log_text.see(tk.END)
+                    self.log_text.config(state='disabled')
+                except Exception as e:
+                    # 防止日誌記錄本身出錯，使用靜默失敗
+                    pass
+            
+            # 安全地更新 GUI
+            if self.gui_running:
+                try:
+                    self.root.after(0, update_log)
+                except Exception:
+                    # 如果 GUI 更新失敗，靜默忽略
+                    pass
+                    
+        except Exception:
+            # 完全靜默的錯誤處理，避免任何可能的遞歸調用
+            pass
+        finally:
+            self._in_log_message = False
+            # 減少隊列大小
+            self._log_queue_size = max(0, getattr(self, '_log_queue_size', 0) - 1)
+            
+            # 檢查是否需要重置限流狀態
+            if self._log_queue_size == 0:
+                self._log_throttle_active = False
+                # 當沒有活躍日誌時，檢查是否可以重置緊急限流
+                if getattr(self, '_emergency_throttle', False):
+                    # 延遲重置緊急限流，給系統時間冷卻
+                    import time
+                    if time.time() - getattr(self, '_last_log_time', 0) > 5.0:  # 5秒冷卻期
+                        self._emergency_throttle = False
+                        self._consecutive_errors = 0
     
     def log_info(self, message, logger_name='GUI'):
         """記錄資訊級別日誌"""
@@ -2530,7 +3353,7 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
   • 組織成員匯出功能
   • 帳號批量匯入自動化
   • 群組權限配置管理
-  • CSV 格式數據處理
+  • Excel/CSV 格式數據處理
   • 完整的組織架構管理
 
 知識庫管理功能:
@@ -2557,10 +3380,16 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
         
         # 複製信息按鈕
         def copy_info():
-            about_window.clipboard_clear()
-            about_window.clipboard_append(system_info)
-            self.log_info("系統信息已複製到剪貼板")
-            messagebox.showinfo("成功", "系統信息已複製到剪貼板")
+            try:
+                about_window.clipboard_clear()
+                about_window.update()  # 強制更新剪貼板
+                about_window.clipboard_append(system_info)
+                about_window.update()  # 再次強制更新
+                self.log_info("系統信息已複製到剪貼板")
+                messagebox.showinfo("成功", "系統信息已複製到剪貼板")
+            except Exception as e:
+                self.log_error(f"複製操作失敗: {str(e)}")
+                messagebox.showerror("錯誤", f"複製失敗: {str(e)}")
         
         ttk.Button(button_frame, text="複製信息", command=copy_info).pack(side='left')
         ttk.Button(button_frame, text="關閉", command=about_window.destroy).pack(side='right')
@@ -2716,7 +3545,17 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
             
             if 'validation' in config:
                 self.similarity_threshold.set(config['validation'].getfloat('similarity_threshold', 0.3))
-                self.max_concurrent.set(config['validation'].getint('max_concurrent_requests', 5))
+                # 兼容舊的設定檔案
+                max_concurrent = 5  # 預設值
+                if 'max_concurrent_users' in config['validation']:
+                    max_concurrent = config['validation'].getint('max_concurrent_users')
+                elif 'max_concurrent_requests' in config['validation']:
+                    max_concurrent = config['validation'].getint('max_concurrent_requests')
+                self.max_concurrent.set(max_concurrent)
+                # 載入 API 延遲設定
+                self.api_delay.set(config['validation'].getfloat('api_delay', 1.0))
+                # 載入重試次數設定
+                self.max_retries.set(config['validation'].getint('max_retries', 3))
                 # RAG 模式固定啟用，不從配置文件讀取
                 # top_k 動態調整，不從配置文件讀取
             
@@ -2738,13 +3577,29 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                 self.kb_base_url.set(config['knowledge_base'].get('base_url', 'http://localhost:8000/api/v1/'))
                 self.kb_api_key.set(config['knowledge_base'].get('api_key', ''))
                 self.kb_export_dir.set(config['knowledge_base'].get('export_dir', ''))
+                self.concurrent_downloads.set(config['knowledge_base'].getint('concurrent_downloads', 1))
+                # 載入載入模式設置
+                if hasattr(self, 'load_all_at_once'):
+                    load_all = config['knowledge_base'].getboolean('load_all_at_once', True)
+                    self.load_all_at_once.set(load_all)
             
             # 載入分隔符設定
             if 'separators' in config:
+                # 建立分隔符別名映射（與保存時相同）
+                separator_aliases = {
+                    '---': 'hyphen_triple',
+                    '|||': 'pipe_triple', 
+                    '\n\n': 'newline_double',
+                    '###': 'hash_triple',
+                    '===': 'equal_triple',
+                    '...': 'dot_triple'
+                }
+                
                 separator_section = config['separators']
                 for sep_key in self.separator_vars:
+                    alias = separator_aliases.get(sep_key, sep_key)
                     # 從配置文件讀取，如果不存在則使用當前值
-                    saved_value = separator_section.getboolean(sep_key, self.separator_vars[sep_key].get())
+                    saved_value = separator_section.getboolean(alias, self.separator_vars[sep_key].get())
                     self.separator_vars[sep_key].set(saved_value)
                 
                 self.log_info(f"分隔符設定已載入: {self.get_selected_separators()}")
@@ -2770,7 +3625,9 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
             
             config['validation'] = {
                 'similarity_threshold': str(self.similarity_threshold.get()),
-                'max_concurrent_requests': str(self.max_concurrent.get()),
+                'max_concurrent_users': str(self.max_concurrent.get()),
+                'api_delay': str(self.api_delay.get()),  # API 呼叫延遲時間
+                'max_retries': str(self.max_retries.get()),  # API 請求重試次數
                 'enable_rag_mode': 'True',  # 固定啟用 RAG 模式
                 'top_k': 'dynamic'  # 動態調整
             }
@@ -2794,13 +3651,26 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
             config['knowledge_base'] = {
                 'base_url': self.kb_base_url.get(),
                 'api_key': self.kb_api_key.get(),
-                'export_dir': self.kb_export_dir.get()
+                'export_dir': self.kb_export_dir.get(),
+                'concurrent_downloads': str(self.concurrent_downloads.get()),
+                'load_all_at_once': str(getattr(self, 'load_all_at_once', tk.BooleanVar(value=True)).get())
             }
             
             # 保存分隔符設定
+            # 建立分隔符別名映射
+            separator_aliases = {
+                '---': 'hyphen_triple',
+                '|||': 'pipe_triple', 
+                '\n\n': 'newline_double',
+                '###': 'hash_triple',
+                '===': 'equal_triple',
+                '...': 'dot_triple'
+            }
+            
             config['separators'] = {}
             for sep_key, var in self.separator_vars.items():
-                config['separators'][sep_key] = str(var.get())
+                alias = separator_aliases.get(sep_key, sep_key)
+                config['separators'][alias] = str(var.get())
             
             with open('config.ini', 'w', encoding='utf-8') as f:
                 config.write(f)
@@ -2954,8 +3824,7 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
         
         # API 配置
         ttk.Label(config_frame, text="API 基礎 URL:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
-        self.kb_base_url_var = tk.StringVar(value="https://api.maiagent.ai/api")
-        kb_base_url_entry = ttk.Entry(config_frame, textvariable=self.kb_base_url_var, width=40)
+        kb_base_url_entry = ttk.Entry(config_frame, textvariable=self.kb_base_url, width=40)
         kb_base_url_entry.grid(row=0, column=1, sticky=tk.W+tk.E, padx=(0, 5))
         
         # 添加URL格式說明
@@ -2964,8 +3833,7 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
         url_help.grid(row=0, column=2, sticky=tk.W, padx=(5, 0))
         
         ttk.Label(config_frame, text="API 金鑰:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5), pady=(5, 0))
-        self.kb_api_key_var = tk.StringVar()
-        kb_api_key_entry = ttk.Entry(config_frame, textvariable=self.kb_api_key_var, width=40, show="*")
+        kb_api_key_entry = ttk.Entry(config_frame, textvariable=self.kb_api_key, width=40, show="*")
         kb_api_key_entry.grid(row=1, column=1, sticky=tk.W+tk.E, padx=(0, 5), pady=(5, 0))
         
         config_frame.columnconfigure(1, weight=1)
@@ -3000,6 +3868,18 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
         
         # 配置滑動條命令
         kb_scroll.config(command=self.kb_listbox.yview)
+        
+        # 檔案載入進度條
+        kb_progress_frame = ttk.Frame(kb_select_frame)
+        kb_progress_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        ttk.Label(kb_progress_frame, text="檔案載入進度:").pack(side=tk.LEFT, padx=(0, 5))
+        self.kb_files_progress = ttk.Progressbar(kb_progress_frame, mode='determinate', maximum=100)
+        self.kb_files_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        # 進度標籤
+        self.kb_progress_label = ttk.Label(kb_progress_frame, text="0/0", width=10)
+        self.kb_progress_label.pack(side=tk.RIGHT)
         
         # 檔案上傳區域
         upload_frame = ttk.LabelFrame(left_frame, text="📁 檔案上傳", padding=10)
@@ -3038,8 +3918,10 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
         export_dir_frame.pack(fill=tk.X, pady=(0, 5))
         
         ttk.Label(export_dir_frame, text="匯出目錄:").pack(side=tk.LEFT, padx=(0, 5))
-        self.kb_export_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), "exports"))
-        export_dir_entry = ttk.Entry(export_dir_frame, textvariable=self.kb_export_dir_var, state="readonly")
+        # 如果沒有設定匯出目錄，使用預設值
+        if not self.kb_export_dir.get():
+            self.kb_export_dir.set(os.path.join(os.getcwd(), "exports"))
+        export_dir_entry = ttk.Entry(export_dir_frame, textvariable=self.kb_export_dir, state="readonly")
         export_dir_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         
         browse_dir_button = ttk.Button(export_dir_frame, text="瀏覽...", command=self.browse_export_directory)
@@ -3060,6 +3942,41 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
         self.kb_export_button = ttk.Button(export_control_frame, text="📂 匯出選中檔案", 
                                          command=self.start_kb_export, state=tk.DISABLED)
         self.kb_export_button.pack(side=tk.RIGHT)
+        
+        # 並發下載配置
+        concurrent_frame = ttk.Frame(export_frame)
+        concurrent_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        ttk.Label(concurrent_frame, text="並發下載數:").pack(side=tk.LEFT, padx=(0, 5))
+        self.concurrent_downloads = tk.IntVar(value=1)  # 固定為 1，完全避免並發
+        concurrent_spinbox = ttk.Spinbox(concurrent_frame, from_=1, to=10, width=5, 
+                                       textvariable=self.concurrent_downloads)
+        concurrent_spinbox.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # 添加說明
+        ttk.Label(concurrent_frame, text="(1-10，數值越高下載越快但可能增加服務器負擔)", 
+                 font=('TkDefaultFont', 8), foreground='gray').pack(side=tk.LEFT)
+        
+        # 載入方式選擇
+        load_mode_frame = ttk.Frame(export_frame)
+        load_mode_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        self.load_all_at_once = tk.BooleanVar(value=True)
+        ttk.Checkbutton(load_mode_frame, text="📦 一次性載入所有文件（減少API調用，推薦）", 
+                       variable=self.load_all_at_once,
+                       command=self.on_load_mode_changed).pack(side=tk.LEFT)
+        
+        # 檔案匯出進度條
+        export_progress_frame = ttk.Frame(export_frame)
+        export_progress_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        ttk.Label(export_progress_frame, text="檔案匯出進度:").pack(side=tk.LEFT, padx=(0, 5))
+        self.kb_export_progress = ttk.Progressbar(export_progress_frame, mode='determinate', maximum=100)
+        self.kb_export_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        # 匯出進度標籤
+        self.kb_export_progress_label = ttk.Label(export_progress_frame, text="0/0", width=10)
+        self.kb_export_progress_label.pack(side=tk.RIGHT)
         
         # 右側面板：檔案列表和日誌
         right_frame = ttk.Frame(paned_window)
@@ -3161,7 +4078,7 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                 async def test():
                     async with MaiAgentApiClient(self.org_export_base_url.get(), 
                                                self.org_export_api_key.get(), 
-                                               self.api_logger_callback) as client:
+                                               None) as client:
                         organizations = await client.get_organizations()
                         return len(organizations)
                 
@@ -3190,7 +4107,7 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                 async def fetch():
                     async with MaiAgentApiClient(self.org_export_base_url.get(), 
                                                self.org_export_api_key.get(), 
-                                               self.api_logger_callback) as client:
+                                               None) as client:
                         return await client.get_organizations()
                 
                 orgs = loop.run_until_complete(fetch())
@@ -3199,7 +4116,8 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                 self.root.after(0, lambda: self.update_export_organization_list(orgs))
                 
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("錯誤", f"載入失敗：{str(e)}"))
+                error_msg = str(e)
+                self.root.after(0, lambda: messagebox.showerror("錯誤", f"載入失敗：{error_msg}"))
         
         threading.Thread(target=load_async, daemon=True).start()
     
@@ -3249,14 +4167,15 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                 self.root.after(0, lambda: self.export_failed("匯出過程中發生錯誤"))
                 
         except Exception as e:
-            self.root.after(0, lambda: self.export_failed(str(e)))
+            error_msg = str(e)
+            self.root.after(0, lambda: self.export_failed(error_msg))
     
     async def export_organization_data(self):
         """匯出組織數據"""
         try:
             async with MaiAgentApiClient(self.org_export_base_url.get(), 
                                        self.org_export_api_key.get(), 
-                                       self.api_logger_callback) as client:
+                                       None) as client:
                 
                 # 獲取權限列表
                 self.log_export("🔐 正在獲取權限列表...")
@@ -3320,7 +4239,7 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                         
                         group_permissions_map[group_id_str] = permission_names
                 
-                # 生成 CSV
+                # 生成 Excel
                 org_name = None
                 for org in self.export_organizations:
                     if org['id'] == self.selected_export_org_id:
@@ -3331,16 +4250,14 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                     org_name = "Unknown"
                 
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                csv_filename = f"organization_members_{org_name}_{timestamp}.csv"
+                excel_filename = f"organization_members_{org_name}_{timestamp}.xlsx"
                 
-                self.log_export(f"📄 正在生成 CSV 文件: {csv_filename}")
+                self.log_export(f"📄 正在生成 Excel 文件: {excel_filename}")
                 
-                with open(csv_filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
-                    fieldnames = ['成員 ID', '姓名', '電子郵件', '是否為擁有者', '建立時間', '所屬群組', '群組權限配置']
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    writer.writeheader()
-                    
-                    for member in members:
+                # 收集所有成員數據
+                member_data_list = []
+                
+                for member in members:
                         if not isinstance(member, dict):
                             continue
                         
@@ -3391,8 +4308,8 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                                                 break
                                         break
                         
-                        # 寫入 CSV
-                        writer.writerow({
+                        # 收集成員數據
+                        member_data_list.append({
                             '成員 ID': member_id_str,
                             '姓名': member_name,
                             '電子郵件': member_email,
@@ -3402,7 +4319,14 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                             '群組權限配置': '; '.join(member_group_permissions)
                         })
                 
-                self.log_export(f"✅ CSV 文件生成完成: {csv_filename}")
+                # 生成 Excel 文件
+                if member_data_list:
+                    df = pd.DataFrame(member_data_list)
+                    df.to_excel(excel_filename, index=False, engine='openpyxl')
+                    self.log_export(f"✅ Excel 文件生成完成: {excel_filename}")
+                else:
+                    self.log_export("⚠️ 無成員數據可匯出")
+                
                 return True
                 
         except Exception as e:
@@ -3438,7 +4362,7 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
         """開始帳號批量匯入"""
         # 檢查設定
         if not self.deploy_csv_file.get():
-            messagebox.showerror("錯誤", "請選擇 CSV 文件")
+            messagebox.showerror("錯誤", "請選擇部署文件 (CSV)")
             return
             
         if not self.deploy_api_key.get():
@@ -3464,14 +4388,15 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                 self.root.after(0, lambda: self.deployment_failed("匯入過程中發生錯誤"))
                 
         except Exception as e:
-            self.root.after(0, lambda: self.deployment_failed(str(e)))
+            error_msg = str(e)
+            self.root.after(0, lambda: self.deployment_failed(error_msg))
     
     async def execute_batch_import(self):
         """執行批量匯入邏輯"""
         try:
             async with MaiAgentApiClient(self.deploy_base_url.get(), 
                                        self.deploy_api_key.get(), 
-                                       self.api_logger_callback) as client:
+                                       None) as client:
                 
                 referral_code = self.deploy_referral_code.get() if self.deploy_create_users.get() else None
                 processor = BatchImportProcessor(client, self.deploy_csv_file.get(), referral_code)
@@ -3520,8 +4445,8 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
     def test_kb_connection(self):
         """測試知識庫 API 連接"""
         # 獲取API配置
-        base_url = self.kb_base_url_var.get().strip()
-        api_key = self.kb_api_key_var.get().strip()
+        base_url = self.kb_base_url.get().strip()
+        api_key = self.kb_api_key.get().strip()
         
         # 詳細的調試信息
         self.log_kb(f"🔍 測試連接 - 基礎URL: {base_url}")
@@ -3546,7 +4471,7 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                 self.root.after(0, lambda: self.log_kb("🚀 開始測試API連接..."))
                 
                 async def test():
-                    async with MaiAgentApiClient(base_url, api_key, self.api_logger_callback) as client:
+                    async with MaiAgentApiClient(base_url, api_key, None) as client:
                         self.root.after(0, lambda: self.log_kb("📡 正在呼叫 get_knowledge_bases API..."))
                         knowledge_bases = await client.get_knowledge_bases()
                         self.root.after(0, lambda: self.log_kb(f"📋 API回應: 找到 {len(knowledge_bases)} 個知識庫"))
@@ -3568,8 +4493,8 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
     def load_knowledge_bases(self):
         """載入知識庫列表"""
         # 獲取API配置
-        base_url = self.kb_base_url_var.get().strip()
-        api_key = self.kb_api_key_var.get().strip()
+        base_url = self.kb_base_url.get().strip()
+        api_key = self.kb_api_key.get().strip()
         
         if not base_url:
             messagebox.showerror("錯誤", "請先輸入 API 基礎 URL")
@@ -3589,7 +4514,7 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                 self.root.after(0, lambda: self.log_kb("🔄 正在載入知識庫列表..."))
                 
                 async def fetch():
-                    async with MaiAgentApiClient(base_url, api_key, self.api_logger_callback) as client:
+                    async with MaiAgentApiClient(base_url, api_key, None) as client:
                         knowledge_bases = await client.get_knowledge_bases()
                         self.root.after(0, lambda: self.log_kb(f"📋 成功獲取 {len(knowledge_bases)} 個知識庫"))
                         return knowledge_bases
@@ -3738,8 +4663,8 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
         
         # 檢查選中的文件
         selected_files = [
-            info['file_info'] for info in self.selected_files.values() 
-            if info['selected']
+            self.file_info_map[item_id] for item_id in self.selected_files
+            if item_id in self.file_info_map
         ]
         
         if not selected_files:
@@ -3747,9 +4672,125 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
             return
         
         self.kb_export_button.config(state='disabled')
-        self.kb_progress_bar['value'] = 0
+        # 重置檔案匯出進度條
+        self.kb_export_progress.configure(value=0)
+        self.kb_export_progress_label.config(text=f"0/{len(selected_files)}")
         
         threading.Thread(target=self.run_kb_export, args=(selected_files,), daemon=True).start()
+    
+    async def _download_single_file_concurrent(self, client, file_info, kb_export_path, download_stats, semaphore, file_index):
+        """並行下載單個文件"""
+        async with semaphore:  # 控制並發數量
+            file_id = file_info.get('id')
+            file_name = file_info.get('filename', file_info.get('name', f'file_{file_id}'))
+            file_status = file_info.get('status', 'unknown')
+            
+            try:
+                # 檢查文件狀態
+                if file_status in ['deleting', 'failed']:
+                    self.log_kb(f"⚠️ 跳過文件 {file_name}：狀態為 {file_status}")
+                    async with download_stats['lock']:
+                        download_stats['failed'] += 1
+                        download_stats['completed'] += 1
+                        self._update_concurrent_progress(download_stats)
+                    return
+                
+                self.log_kb(f"📥 開始下載文件: {file_name}")
+                
+                # 下載文件（使用重試機制）
+                file_data = await client.download_knowledge_base_file(self.selected_kb_id, file_id, max_retries=3)
+                
+                # 保存文件
+                file_path = kb_export_path / file_name
+                with open(file_path, 'wb') as f:
+                    f.write(file_data)
+                
+                self.log_kb(f"✅ 文件下載成功: {file_name} ({len(file_data)} bytes)")
+                
+                # 更新統計
+                async with download_stats['lock']:
+                    download_stats['successful'] += 1
+                    download_stats['completed'] += 1
+                    self._update_concurrent_progress(download_stats)
+                    
+            except Exception as e:
+                error_msg = str(e)
+                self.log_kb(f"❌ 文件下載失敗: {file_name} (ID: {file_id})")
+                self.log_kb(f"   錯誤詳情: {error_msg}")
+                
+                # 根據錯誤類型提供更具體的說明
+                if "502" in error_msg or "503" in error_msg or "504" in error_msg:
+                    self.log_kb(f"   可能原因: 服務器暫時不可用，已嘗試重試")
+                elif "404" in error_msg:
+                    self.log_kb(f"   可能原因: 文件不存在或無下載權限")
+                elif "超時" in error_msg:
+                    self.log_kb(f"   可能原因: 網路連接超時")
+                
+                # 更新統計
+                async with download_stats['lock']:
+                    download_stats['failed'] += 1
+                    download_stats['completed'] += 1
+                    self._update_concurrent_progress(download_stats)
+    
+    def _update_concurrent_progress(self, download_stats):
+        """更新並行下載進度（線程安全）"""
+        if not self.gui_running:
+            return
+            
+        completed = download_stats['completed']
+        total = download_stats['total']
+        successful = download_stats['successful']
+        failed = download_stats['failed']
+        
+        # 更新進度條（線程安全）
+        progress = (completed / total) * 100 if total > 0 else 0
+        try:
+            self.root.after(0, lambda p=progress: self._safe_update_progress_bar(p))
+            self.root.after(0, lambda c=completed, t=total, s=successful, f=failed: 
+                           self._safe_update_progress_label(c, t, s, f))
+        except Exception as e:
+            # 如果 GUI 更新失敗，記錄但不拋出異常
+            print(f"GUI 更新失敗: {e}")
+    
+    def _safe_update_progress_bar(self, progress_value):
+        """安全更新進度條"""
+        try:
+            if self.gui_running and hasattr(self, 'kb_export_progress'):
+                self.kb_export_progress.configure(value=progress_value)
+        except Exception:
+            pass
+            
+    def _safe_update_progress_label(self, completed, total, successful, failed):
+        """安全更新進度標籤"""
+        try:
+            if self.gui_running and hasattr(self, 'kb_export_progress_label'):
+                self.kb_export_progress_label.config(text=f"{completed}/{total} (成功:{successful}, 失敗:{failed})")
+        except Exception:
+            pass
+    
+    def _safe_update_kb_progress_bar(self, progress_value):
+        """安全更新知識庫文件載入進度條"""
+        try:
+            if self.gui_running and hasattr(self, 'kb_files_progress'):
+                self.kb_files_progress.configure(value=progress_value)
+        except Exception:
+            pass
+            
+    def _safe_update_kb_progress_label(self, current, total):
+        """安全更新知識庫文件載入進度標籤"""
+        try:
+            if self.gui_running and hasattr(self, 'kb_progress_label'):
+                self.kb_progress_label.config(text=f"{current}/{total}")
+        except Exception:
+            pass
+    
+    def _safe_update_kb_progress_label_text(self, text):
+        """安全更新知識庫文件載入進度標籤（任意文本）"""
+        try:
+            if self.gui_running and hasattr(self, 'kb_progress_label'):
+                self.kb_progress_label.config(text=text)
+        except Exception:
+            pass
     
     def run_kb_export(self, selected_files):
         """執行知識庫文件匯出（在背景執行緒中）"""
@@ -3757,23 +4798,37 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             
-            success = loop.run_until_complete(self.export_kb_files(selected_files))
+            result = loop.run_until_complete(self.export_kb_files(selected_files))
             loop.close()
             
-            if success:
-                self.root.after(0, self.kb_export_completed)
+            if isinstance(result, dict):  # 成功，包含統計信息
+                export_stats = result
+                if self.gui_running:
+                    self.root.after(0, lambda: self.kb_export_completed(export_stats))
+            elif result:  # 舊版本的布爾返回值
+                if self.gui_running:
+                    self.root.after(0, lambda: self.kb_export_completed())
             else:
-                self.root.after(0, lambda: self.kb_export_failed("匯出過程中發生錯誤"))
+                if self.gui_running:
+                    self.root.after(0, lambda: self.kb_export_failed("匯出過程中發生錯誤"))
                 
         except Exception as e:
-            self.root.after(0, lambda: self.kb_export_failed(str(e)))
+            error_msg = str(e)
+            if self.gui_running:
+                self.root.after(0, lambda: self.kb_export_failed(error_msg))
     
     async def export_kb_files(self, selected_files):
-        """匯出知識庫文件"""
+        """匯出知識庫文件（終極串行下載 - 完全無日誌）"""
         try:
+            # 終極靜默模式 - 完全禁用所有日誌和GUI更新
+            self._download_in_progress = True
+            self._emergency_throttle = True  # 強制啟用緊急限流
+            print(f"[SILENT] 開始串行下載 {len(selected_files)} 個文件")
+            
+            # 使用完全無日誌的API客戶端
             async with MaiAgentApiClient(self.kb_base_url.get(), 
                                        self.kb_api_key.get(), 
-                                       self.api_logger_callback) as client:
+                                       None) as client:
                 
                 total_files = len(selected_files)
                 export_dir = Path(self.kb_export_dir.get())
@@ -3788,60 +4843,261 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                 kb_export_path = export_dir / f"knowledge_base_{kb_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 kb_export_path.mkdir(parents=True, exist_ok=True)
                 
-                self.log_kb(f"📁 創建匯出目錄: {kb_export_path}")
+                print(f"[DOWNLOAD] 創建匯出目錄: {kb_export_path}")
+                print(f"[DOWNLOAD] 開始串行下載 {total_files} 個文件")
                 
-                successful_exports = 0
-                failed_exports = 0
+                # 串行下載統計
+                successful = 0
+                failed = 0
                 
+                # 串行下載每個文件 - 修復文件名和進度條問題
                 for i, file_info in enumerate(selected_files):
+                    # 安全的文件處理流程
+                    safe_filename = "unknown_file"
+                    final_filename = "unknown_file"
+                    
                     try:
-                        file_id = file_info.get('id')
-                        file_name = file_info.get('name', f'file_{file_id}')
+                        # 處理文件名：長度限制和特殊字符清理
+                        original_filename = file_info.get('filename', f'file_{file_info.get("id", "unknown")}')
+                        safe_filename = self._sanitize_filename(original_filename)
+                        print(f"[DOWNLOAD] 下載 {i+1}/{total_files}: {safe_filename}")
                         
-                        self.log_kb(f"📥 正在下載文件: {file_name}")
+                        # 確保文件名唯一（避免重複）
+                        final_filename = self._ensure_unique_filename(kb_export_path, safe_filename)
                         
-                        # 更新進度
-                        progress = (i / total_files) * 100
-                        self.root.after(0, lambda p=progress: setattr(self.kb_progress_bar, 'value', p))
+                        # 簡單下載 - 無重試，無複雜錯誤處理
+                        file_content = await client.download_knowledge_base_file(
+                            self.selected_kb_id, file_info['id'], max_retries=1
+                        )
                         
-                        # 下載文件
-                        file_data = await client.download_knowledge_base_file(self.selected_kb_id, file_id)
-                        
-                        # 保存文件
-                        file_path = kb_export_path / file_name
+                        # 安全保存文件
+                        file_path = kb_export_path / final_filename
                         with open(file_path, 'wb') as f:
-                            f.write(file_data)
+                            f.write(file_content)
                         
-                        self.log_kb(f"✅ 文件下載成功: {file_name} ({len(file_data)} bytes)")
-                        successful_exports += 1
+                        successful += 1
+                        print(f"[DOWNLOAD] ✅ 成功: {final_filename}")
                         
                     except Exception as e:
-                        self.log_kb(f"❌ 文件下載失敗: {file_name} - {str(e)}")
-                        failed_exports += 1
+                        failed += 1
+                        print(f"[DOWNLOAD] ❌ 失敗: {final_filename} - {str(e)[:100]}")
+                    
+                    # 安全更新進度條（重新啟用，但使用簡化版本）
+                    progress = ((i + 1) / total_files) * 100
+                    print(f"[DOWNLOAD] 進度: {progress:.1f}% ({successful} 成功, {failed} 失敗)")
+                    
+                    # 安全的GUI進度更新（修復Lambda閉包問題）
+                    try:
+                        if self.gui_running:
+                            # 創建局部變量副本，避免Lambda閉包問題
+                            current_progress = progress
+                            current_index = i + 1
+                            current_successful = successful
+                            current_failed = failed
+                            self.root.after(0, 
+                                lambda: self._update_export_progress_safe(
+                                    current_progress, current_index, total_files, 
+                                    current_successful, current_failed
+                                )
+                            )
+                    except Exception:
+                        # 忽略GUI更新錯誤，繼續下載
+                        pass
                 
-                # 完成進度
-                self.root.after(0, lambda: setattr(self.kb_progress_bar, 'value', 100))
+                # 最終統計（含安全GUI更新）
+                print(f"[DOWNLOAD] 📊 串行下載完成統計:")
+                print(f"[DOWNLOAD]    成功: {successful} 個文件")
+                print(f"[DOWNLOAD]    失敗: {failed} 個文件")
+                print(f"[DOWNLOAD]    總計: {total_files} 個文件")
+                print(f"[DOWNLOAD]    匯出目錄: {kb_export_path}")
                 
-                self.log_kb(f"📊 匯出完成統計:")
-                self.log_kb(f"   成功: {successful_exports} 個文件")
-                self.log_kb(f"   失敗: {failed_exports} 個文件")
-                self.log_kb(f"   匯出目錄: {kb_export_path}")
+                # 最終進度條更新（修復Lambda閉包）
+                try:
+                    if self.gui_running:
+                        # 創建最終值的局部副本
+                        final_successful = successful
+                        final_failed = failed
+                        final_total = total_files
+                        self.root.after(0, 
+                            lambda: self._update_export_progress_safe(
+                                100, final_total, final_total, final_successful, final_failed
+                            )
+                        )
+                except Exception:
+                    pass
                 
-                return successful_exports > 0
+                # 根據成功率判定匯出結果
+                success_rate = successful / total_files if total_files > 0 else 0
+                
+                # 準備統計信息
+                export_stats = {
+                    'successful': successful,
+                    'failed': failed,
+                    'total': total_files,
+                    'success_rate': success_rate,
+                    'concurrent': 1  # 串行下載
+                }
+                
+                if successful > 0:
+                    if failed == 0:
+                        print(f"[DOWNLOAD] 🎉 串行下載完全成功！")
+                    elif success_rate >= 0.8:  # 80% 成功率視為成功
+                        print(f"[DOWNLOAD] ✅ 串行下載基本成功（成功率: {success_rate:.1%}）")
+                    else:
+                        print(f"[DOWNLOAD] ⚠️ 串行下載部分成功（成功率: {success_rate:.1%}）")
+                    return export_stats
+                else:
+                    # 完全失敗
+                    raise Exception(f"串行下載完全失敗：{failed} 個文件都無法下載")
                 
         except Exception as e:
-            self.log_kb(f"❌ 匯出失敗: {str(e)}")
+            print(f"[DOWNLOAD] ❌ 匯出失敗: {str(e)}")
             return False
+        finally:
+            # 禁用下載靜默模式
+            self._download_in_progress = False
+            self._emergency_throttle = False
+            print("[DOWNLOAD] 下載完成，靜默模式已禁用")
     
-    def kb_export_completed(self):
+    def _sanitize_filename(self, filename: str) -> str:
+        """清理文件名：處理長度限制和特殊字符（增強版本）"""
+        try:
+            import re
+            import os
+            import time
+            
+            # 安全檢查輸入
+            if not filename or not isinstance(filename, str):
+                return f"safe_file_{int(time.time())}.txt"
+            
+            # 移除或替換不安全的字符
+            # 保留中文字符，只替換文件系統不支持的字符
+            unsafe_chars = r'[<>:"/\\|?*\x00-\x1f\x7f-\x9f]'
+            safe_filename = re.sub(unsafe_chars, '_', filename)
+            
+            # 移除連續的下劃線和前後空白
+            safe_filename = re.sub(r'_+', '_', safe_filename).strip('_. ')
+            
+            # 處理文件名長度限制（保留副檔名）
+            name_part, ext_part = os.path.splitext(safe_filename)
+            max_name_length = 180  # 更保守的限制
+            
+            if len(name_part) > max_name_length:
+                # 截斷名稱部分，保持副檔名
+                name_part = name_part[:max_name_length].rstrip('._')
+                safe_filename = name_part + ext_part
+            
+            # 確保文件名不為空和有效
+            if not safe_filename or safe_filename in ['.', '..', '_']:
+                safe_filename = f"safe_file_{int(time.time())}.txt"
+            
+            # 確保有副檔名
+            if '.' not in safe_filename:
+                safe_filename += '.txt'
+            
+            return safe_filename
+            
+        except Exception:
+            # 如果任何步驟失敗，返回安全的預設值
+            import time
+            return f"fallback_file_{int(time.time())}.txt"
+    
+    def _ensure_unique_filename(self, directory: Path, filename: str) -> str:
+        """確保文件名在目錄中唯一（增強版本）"""
+        try:
+            import os
+            import time
+            
+            # 安全檢查輸入
+            if not filename:
+                filename = f"safe_file_{int(time.time())}.txt"
+            
+            base_path = directory / filename
+            if not base_path.exists():
+                return filename
+            
+            # 文件已存在，添加序號
+            name_part, ext_part = os.path.splitext(filename)
+            
+            # 限制循環次數，防止無限循環
+            for counter in range(1, 100):
+                new_filename = f"{name_part}_{counter}{ext_part}"
+                new_path = directory / new_filename
+                if not new_path.exists():
+                    return new_filename
+            
+            # 如果100次都不行，使用時間戳
+            timestamp = int(time.time())
+            return f"{name_part}_{timestamp}{ext_part}"
+            
+        except Exception:
+            # 如果任何步驟失敗，返回帶時間戳的安全名稱
+            import time
+            return f"emergency_file_{int(time.time())}.txt"
+    
+    def _update_export_progress_safe(self, progress: float, current: int, total: int, successful: int, failed: int):
+        """安全的進度條更新方法"""
+        try:
+            if not self.gui_running:
+                return
+                
+            # 更新進度條
+            if hasattr(self, 'kb_export_progress'):
+                self.kb_export_progress.configure(value=progress)
+            
+            # 更新標籤
+            if hasattr(self, 'kb_export_progress_label'):
+                status_text = f"{current}/{total} 檔案 (成功: {successful}, 失敗: {failed})"
+                self.kb_export_progress_label.config(text=status_text)
+                
+        except Exception:
+            # 完全忽略GUI更新錯誤
+            pass
+    
+    def kb_export_completed(self, export_stats=None):
         """知識庫匯出完成"""
+        # 確保關閉靜默模式
+        self._download_in_progress = False
+        self._emergency_throttle = False
+        print("[DOWNLOAD] 下載完成，靜默模式已禁用")
+        
         self.kb_export_button.config(state='normal')
-        messagebox.showinfo("匯出完成", "知識庫文件匯出已成功完成！")
+        # 重置進度條
+        self.kb_export_progress.configure(value=0)
+        self.kb_export_progress_label.config(text="0/0")
+        
+        # 顯示詳細的匯出結果
+        if export_stats:
+            successful = export_stats.get('successful', 0)
+            failed = export_stats.get('failed', 0)
+            total = successful + failed
+            concurrent = export_stats.get('concurrent', 1)
+            
+            if failed == 0:
+                message = f"知識庫文件並行下載完全成功！\n\n成功匯出 {successful} 個文件\n並發數: {concurrent}"
+                title = "並行下載完成"
+            else:
+                success_rate = (successful / total) * 100 if total > 0 else 0
+                message = f"知識庫文件並行下載已完成！\n\n成功: {successful} 個文件\n失敗: {failed} 個文件\n成功率: {success_rate:.1f}%\n並發數: {concurrent}"
+                title = "並行下載完成"
+        else:
+            message = "知識庫文件並行下載已成功完成！"
+            title = "並行下載完成"
+            
+        messagebox.showinfo(title, message)
         self.log_info("知識庫文件匯出完成", 'KnowledgeBase')
     
     def kb_export_failed(self, error_message):
         """知識庫匯出失敗"""
+        # 確保關閉靜默模式
+        self._download_in_progress = False
+        self._emergency_throttle = False
+        print("[DOWNLOAD] 下載失敗，靜默模式已禁用")
+        
         self.kb_export_button.config(state='normal')
+        # 重置進度條
+        self.kb_export_progress.configure(value=0)
+        self.kb_export_progress_label.config(text="匯出失敗")
         messagebox.showerror("匯出失敗", f"匯出過程發生錯誤：{error_message}")
         self.log_error(f"知識庫文件匯出失敗: {error_message}", 'KnowledgeBase')
     
@@ -3931,7 +5187,7 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                 asyncio.set_event_loop(loop)
                 try:
                     async def upload():
-                        async with MaiAgentApiClient(base_url, api_key, self.api_logger_callback) as client:
+                        async with MaiAgentApiClient(base_url, api_key, None) as client:
                             result = await client.upload_file_to_knowledge_base(
                                 kb_id=self.current_kb_id,
                                 file_path=file_path
@@ -3989,15 +5245,40 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
         try:
             # 設定關閉時的清理
             def on_closing():
-                self.log_info("MaiAgent 驗證工具正在關閉...")
-                self.log_info(f"最終日誌統計: {self.get_log_stats()}")
+                self.gui_running = False  # 停止所有 GUI 更新
+                try:
+                    self.log_info("MaiAgent 驗證工具正在關閉...")
+                    self.log_info(f"最終日誌統計: {self.get_log_stats()}")
+                except:
+                    # 如果日誌記錄失敗，直接關閉
+                    pass
                 self.root.destroy()
             
             self.root.protocol("WM_DELETE_WINDOW", on_closing)
             self.root.mainloop()
         except Exception as e:
-            self.log_error(f"應用程式執行錯誤: {str(e)}")
-            raise
+            # 完全安全的異常處理 - 避免任何可能的遞歸
+            error_type = type(e).__name__
+            error_msg = str(e)[:200]  # 限制錯誤訊息長度
+            
+            print(f"[SAFE-ERROR] 應用程式執行錯誤: {error_msg}")
+            print(f"[SAFE-ERROR] 錯誤類型: {error_type}")
+            
+            # 如果是遞歸錯誤，立即啟用所有安全機制
+            if isinstance(e, RecursionError) or "recursion" in error_msg.lower() or "maximum" in error_msg.lower():
+                self._emergency_throttle = True
+                self._download_in_progress = False  # 停止下載
+                print("[SAFE-ERROR] 偵測到遞歸錯誤，啟用緊急保護模式")
+                
+                # 嘗試清理GUI狀態
+                try:
+                    if hasattr(self, 'root') and self.root:
+                        self.root.after(100, lambda: setattr(self, 'gui_running', False))
+                except:
+                    pass
+            
+            # 不調用任何可能遞歸的方法，直接退出
+            return
 
     def on_kb_selection_changed(self, event):
         """知識庫選擇變更處理"""
@@ -4020,6 +5301,15 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
             if hasattr(self, 'upload_start_button'):
                 self.upload_start_button.config(state=tk.DISABLED)
     
+    def on_load_mode_changed(self):
+        """載入模式變更處理"""
+        if hasattr(self, 'load_all_at_once'):
+            mode = "一次性載入" if self.load_all_at_once.get() else "分頁載入"
+            self.log_kb(f"📋 載入模式已變更為: {mode}")
+            # 如果已經載入了文件，提示用戶重新載入
+            if hasattr(self, 'files_tree') and self.files_tree.get_children():
+                self.log_kb("💡 模式變更後，請重新載入文件以套用新設置")
+    
     def load_kb_files(self):
         """載入知識庫檔案列表"""
         if not self.current_kb_id and not self.selected_kb_id:
@@ -4028,8 +5318,8 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
             return
         
         # 獲取API配置
-        base_url = self.kb_base_url_var.get().strip()
-        api_key = self.kb_api_key_var.get().strip()
+        base_url = self.kb_base_url.get().strip()
+        api_key = self.kb_api_key.get().strip()
         
         if not base_url:
             messagebox.showerror("錯誤", "請先輸入 API 基礎 URL")
@@ -4044,28 +5334,58 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
         # 使用current_kb_id或selected_kb_id
         kb_id = self.current_kb_id or self.selected_kb_id
         
+        def update_progress(current, total):
+            """更新進度條（線程安全）"""
+            if not self.gui_running:
+                return
+                
+            if total > 0:
+                progress = (current / total) * 100
+                try:
+                    self.root.after(0, lambda p=progress: self._safe_update_kb_progress_bar(p))
+                    self.root.after(0, lambda c=current, t=total: self._safe_update_kb_progress_label(c, t))
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.root.after(0, lambda: self._safe_update_kb_progress_bar(0))
+                    self.root.after(0, lambda: self._safe_update_kb_progress_label(0, 0))
+                except Exception:
+                    pass
+        
         def load_async():
             try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 
-                self.root.after(0, lambda: self.log_kb(f"🔄 正在載入知識庫檔案 (ID: {kb_id})..."))
+                # 重置進度條
+                self.root.after(0, lambda: self._safe_update_kb_progress_bar(0))
+                self.root.after(0, lambda: self._safe_update_kb_progress_label_text("載入中..."))
+                
+                self.root.after(0, lambda: self.log_kb(f"�� 正在載入知識庫檔案 (ID: {kb_id})..."))
                 
                 async def fetch():
-                    async with MaiAgentApiClient(base_url, api_key, self.api_logger_callback) as client:
-                        files = await client.get_knowledge_base_files(kb_id)
-                        self.root.after(0, lambda: self.log_kb(f"📋 成功獲取 {len(files)} 個檔案"))
+                    async with MaiAgentApiClient(base_url, api_key, None) as client:
+                        load_all = getattr(self, 'load_all_at_once', tk.BooleanVar(value=True)).get()
+                        files = await client.get_knowledge_base_files(kb_id, progress_callback=update_progress, load_all_at_once=load_all)
+                        mode_text = "一次性載入" if load_all else "分頁載入"
+                        self.root.after(0, lambda: self.log_kb(f"📋 成功獲取 {len(files)} 個檔案（{mode_text}）"))
                         return files
                 
                 files = loop.run_until_complete(fetch())
                 loop.close()
                 
+                # 完成進度
+                self.root.after(0, lambda: self._safe_update_kb_progress_bar(100))
                 self.root.after(0, lambda: self.update_files_list(files))
                 
             except Exception as e:
                 error_msg = str(e)
                 self.root.after(0, lambda: self.log_kb(f"❌ 載入檔案失敗: {error_msg}"))
                 self.root.after(0, lambda: messagebox.showerror("錯誤", f"載入檔案列表失敗：{error_msg}"))
+                # 重置進度條
+                self.root.after(0, lambda: self._safe_update_kb_progress_bar(0))
+                self.root.after(0, lambda: self._safe_update_kb_progress_label_text("載入失敗"))
         
         threading.Thread(target=load_async, daemon=True).start()
 
