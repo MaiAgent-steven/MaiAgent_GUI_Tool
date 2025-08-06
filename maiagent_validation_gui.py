@@ -96,6 +96,7 @@ class ValidationRow:
     建議_or_正確答案: str
     應參考的文件: str
     應參考的文件段落: str
+    是否檢索KM推薦: str = ""  # 新增欄位，控制是否進行驗證
     
     # API 回覆結果（自動填入）
     AI助理回覆: str = ""
@@ -112,6 +113,12 @@ class ValidationRow:
     recall: float = 0.0
     f1_score: float = 0.0
     hit_rate: float = 0.0
+    
+    # 參考文件命中統計（新增）
+    參考文件命中率: float = 0.0
+    期望文件總數: int = 0
+    命中文件數: int = 0
+    未命中文件: str = ""
     
     # 用於儲存原始 API 回傳數據
     _raw_citation_nodes: List[Dict] = None
@@ -284,7 +291,7 @@ class MaiAgentApiClient:
             'Content-Type': 'application/json'
         }
         # 添加超時設定和連接池配置
-        timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
+        timeout = aiohttp.ClientTimeout(total=90, connect=10, sock_read=60)
         connector = aiohttp.TCPConnector(
             limit=100,  # 總連接池大小
             limit_per_host=20,  # 每個主機的連接數
@@ -435,16 +442,35 @@ class MaiAgentApiClient:
             except (aiohttp.ClientError, aiohttp.ServerTimeoutError, asyncio.TimeoutError, 
                     ConnectionError, OSError) as e:
                 last_exception = e
+                error_str = str(e).lower()
+                
+                # 特殊處理連接重置錯誤（WinError 10054）
+                is_connection_reset = any(keyword in error_str for keyword in [
+                    'winerror 10054', 'connection was forcibly closed', 
+                    'connection reset', 'connection aborted'
+                ])
+                
                 if self.logger_callback:
-                    self.logger_callback('log_warning', f"⚠️ API 請求失敗 (嘗試 {attempt + 1}/{max_retries}): {str(e)}", 'API')
+                    if is_connection_reset:
+                        self.logger_callback('log_warning', f"🔌 連接被遠端主機重置 (嘗試 {attempt + 1}/{max_retries}): {str(e)}", 'API')
+                        self.logger_callback('log_info', f"   💡 建議：降低併發數量或增加延遲時間", 'API')
+                    else:
+                        self.logger_callback('log_warning', f"⚠️ API 請求失敗 (嘗試 {attempt + 1}/{max_retries}): {str(e)}", 'API')
                 
                 if attempt < max_retries - 1:
-                    # 指數退避策略：每次重試等待時間加倍
-                    wait_time = 2 ** attempt
+                    # 對於連接重置錯誤，使用更長的等待時間
+                    if is_connection_reset:
+                        wait_time = (2 ** attempt) * 2  # 連接重置時等待時間翻倍
+                    else:
+                        wait_time = 2 ** attempt  # 指數退避策略：每次重試等待時間加倍
+                    
                     if self.logger_callback:
                         # 使用安全的日誌記錄方式，避免 GUI 線程問題
                         try:
-                            self.logger_callback('log_info', f"   ⏰ {wait_time} 秒後重試...", 'API')
+                            if is_connection_reset:
+                                self.logger_callback('log_info', f"   ⏰ 連接重置錯誤，等待 {wait_time} 秒後重試...", 'API')
+                            else:
+                                self.logger_callback('log_info', f"   ⏰ {wait_time} 秒後重試...", 'API')
                         except Exception:
                             print(f"   ⏰ {wait_time} 秒後重試...")
                     await asyncio.sleep(wait_time)
@@ -1462,11 +1488,61 @@ class EnhancedTextMatcher:
     """增強版文字比對工具，支援 RAG 系統優化"""
     
     @staticmethod
-    def calculate_similarity(text1: str, text2: str) -> float:
-        """計算兩個文字的相似度（0-1之間）"""
+    def calculate_similarity(text1: str, text2: str, mode: str = "standard", expected_segments: List[str] = None) -> float:
+        """計算兩個文字的相似度（0-1之間）
+        
+        Args:
+            text1: 第一個文字（通常是AI回覆段落）
+            text2: 第二個文字（通常是預期段落）
+            mode: 計算模式，"standard" 或 "character_ratio"
+            expected_segments: 所有預期段落列表（僅在character_ratio模式下使用）
+        """
         if not text1 or not text2:
             return 0.0
-        return SequenceMatcher(None, text1.lower().strip(), text2.lower().strip()).ratio()
+            
+        if mode == "character_ratio":
+            # 新的字符比例模式：匹配字符數 / 應參考的文件節點總長度
+            return EnhancedTextMatcher._calculate_character_ratio_similarity(text1, text2, expected_segments)
+        else:
+            # 標準模式：使用SequenceMatcher
+            return SequenceMatcher(None, text1.lower().strip(), text2.lower().strip()).ratio()
+    
+    @staticmethod
+    def _calculate_character_ratio_similarity(ai_chunk: str, expected_segment: str, expected_segments: List[str] = None) -> float:
+        """計算字符比例相似度：匹配字符數 / 應參考的文件節點總長度
+        
+        Args:
+            ai_chunk: AI回覆的文字段落
+            expected_segment: 預期的文字段落
+            expected_segments: 所有預期段落列表
+        """
+        if not ai_chunk or not expected_segment:
+            return 0.0
+            
+        # 預處理文字
+        ai_text = ai_chunk.lower().strip()
+        expected_text = expected_segment.lower().strip()
+        
+        # 計算匹配的字符數
+        matcher = SequenceMatcher(None, ai_text, expected_text)
+        matching_blocks = matcher.get_matching_blocks()
+        matched_chars = sum(block.size for block in matching_blocks)
+        
+        # 計算應參考的文件節點總長度
+        if expected_segments:
+            total_expected_length = sum(len(seg.strip()) for seg in expected_segments)
+        else:
+            total_expected_length = len(expected_text)
+        
+        # 避免除零錯誤
+        if total_expected_length == 0:
+            return 0.0
+            
+        # 計算比例
+        ratio = matched_chars / total_expected_length
+        
+        # 確保結果在0-1之間
+        return min(1.0, max(0.0, ratio))
     
     @staticmethod
     def contains_keywords(text: str, keywords: str) -> bool:
@@ -1514,7 +1590,7 @@ class EnhancedTextMatcher:
             else:
                 continue
                 
-            similarity = cls.calculate_similarity(node_content, expected_content)
+            similarity = cls.calculate_similarity(node_content, expected_content)  # 使用預設standard模式
 
                 
             
@@ -1532,7 +1608,7 @@ class EnhancedTextMatcher:
     @classmethod
     def check_rag_enhanced_hit(cls, citation_nodes: List[Dict], expected_content: str, 
                              similarity_threshold: float = 0.3, top_k: Optional[int] = None,
-                             custom_separators: List[str] = None) -> Tuple[bool, Dict]:
+                             custom_separators: List[str] = None, similarity_mode: str = "standard") -> Tuple[bool, Dict]:
         """RAG 增強的命中檢查，支援多段落和詳細指標"""
         if not citation_nodes or not expected_content:
             return False, {
@@ -1600,7 +1676,7 @@ class EnhancedTextMatcher:
             best_match = {"chunk_idx": -1, "similarity": 0.0}
             
             for chunk in rag_chunks:
-                similarity = cls.calculate_similarity(chunk['content'], expected_seg)
+                similarity = cls.calculate_similarity(chunk['content'], expected_seg, similarity_mode, expected_segments)
                 
                 if similarity >= similarity_threshold:
                     if not segment_hit:  # 第一次找到匹配
@@ -1647,26 +1723,75 @@ class EnhancedTextMatcher:
         return is_hit, result
     
     @classmethod
-    def check_citation_file_match(cls, citations: List[Dict], expected_files: str) -> Tuple[bool, str]:
-        """檢查參考文件是否正確"""
+    def check_citation_file_match(cls, citations: List[Dict], expected_files: str) -> Tuple[bool, Dict]:
+        """檢查參考文件是否正確（支援逗號和換行符分割，全部命中制）"""
         if not citations or not expected_files:
-            return False, "無引用文件或預期文件為空"
+            return False, {
+                "detail": "無引用文件或預期文件為空",
+                "total_expected": 0,
+                "total_matched": 0,
+                "hit_rate": 0.0,
+                "matched_files": [],
+                "unmatched_files": [],
+                "all_matched": False
+            }
         
-        expected_file_list = [f.strip() for f in expected_files.split(',') if f.strip()]
+        # 先用換行符分割，再用逗號分割，去除重複
+        expected_file_list = []
+        
+        # 先按換行符分割
+        lines = expected_files.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line:
+                # 每行內部可能還有逗號分割的文件
+                files_in_line = [f.strip() for f in line.split(',') if f.strip()]
+                expected_file_list.extend(files_in_line)
+        
+        # 去除重複的文件名稱
+        expected_file_list = list(set(expected_file_list))
+        
         cited_files = []
         
         for citation in citations:
             if 'filename' in citation:
                 cited_files.append(citation['filename'])
         
+        # 記錄每個期望文件的匹配情況
+        matched_expected_files = set()
         matches = []
+        
         for expected_file in expected_file_list:
+            file_matched = False
             for cited_file in cited_files:
                 if cls.contains_keywords(cited_file, expected_file) or cls.calculate_similarity(cited_file, expected_file) > 0.7:
                     matches.append(f"{expected_file} -> {cited_file}")
+                    matched_expected_files.add(expected_file)
+                    file_matched = True
+                    break  # 每個期望文件只需要匹配一次
         
-        is_correct = len(matches) > 0
-        result_detail = f"匹配文件: {len(matches)} 個"
+        # 計算統計數據
+        total_expected = len(expected_file_list)
+        total_matched = len(matched_expected_files)
+        hit_rate = total_matched / total_expected if total_expected > 0 else 0.0
+        
+        # 找出未匹配的文件
+        unmatched_files = [f for f in expected_file_list if f not in matched_expected_files]
+        
+        # 新的判斷邏輯：所有期望文件都必須被匹配
+        all_matched = total_matched == total_expected
+        is_correct = all_matched
+        
+        result_detail = {
+            "detail": f"匹配文件: {total_matched}/{total_expected} 個 (命中率: {hit_rate:.1%})",
+            "total_expected": total_expected,
+            "total_matched": total_matched,
+            "hit_rate": hit_rate,
+            "matched_files": list(matched_expected_files),
+            "unmatched_files": unmatched_files,
+            "all_matched": all_matched,
+            "matches": matches
+        }
         
         return is_correct, result_detail
 
@@ -1799,6 +1924,9 @@ class MaiAgentValidatorGUI:
             '...': tk.BooleanVar(value=False),     # 三個點
         }
         
+        # 相似度計算模式設定
+        self.similarity_mode = tk.StringVar(value="standard")  # standard 或 character_ratio
+        
         # 組織管理相關變數
         self.org_export_api_key = tk.StringVar()
         self.org_export_base_url = tk.StringVar(value="https://api.maiagent.ai/api/v1/")
@@ -1875,10 +2003,11 @@ class MaiAgentValidatorGUI:
             pass
     
     def api_logger_callback(self, method_name, *args, **kwargs):
-        """API日誌回調函數 - 完全禁用版本（防止所有遞歸錯誤）"""
+        """API日誌回調函數 - 啟用詳細日誌版本（帶安全保護）"""
         
-        # 完全禁用API日誌回調處理 - 防止任何遞歸可能性
-        return
+        # 檢查是否已初始化完成，避免初始化期間的調用
+        if not hasattr(self, 'root') or not hasattr(self, 'log_text'):
+            return
         
         # 下載期間靜默模式 - 完全禁用API日誌處理
         if getattr(self, '_download_in_progress', False):
@@ -2016,6 +2145,21 @@ class MaiAgentValidatorGUI:
         param_frame.pack(fill='x', pady=(0, 10))
         
         # 系統固定使用 RAG 增強模式，檢索片段數量動態調整
+        
+        # 相似度計算模式選擇
+        ttk.Label(param_frame, text="相似度計算模式：").pack(anchor='w', pady=(0, 5))
+        similarity_mode_frame = ttk.Frame(param_frame)
+        similarity_mode_frame.pack(fill='x', pady=(0, 10))
+        
+        ttk.Radiobutton(similarity_mode_frame, text="標準模式 (SequenceMatcher)", 
+                       variable=self.similarity_mode, value="standard").pack(anchor='w')
+        ttk.Radiobutton(similarity_mode_frame, text="字符比例模式 (匹配字符數/應參考節點)", 
+                       variable=self.similarity_mode, value="character_ratio").pack(anchor='w')
+        
+        # 添加模式說明
+        mode_help = ttk.Label(param_frame, text="  ↳ 標準模式：基於最長公共子序列 | 字符比例模式：匹配字符數除以預期段落總長度", 
+                             font=('Arial', 8), foreground='gray')
+        mode_help.pack(anchor='w', pady=(0, 10))
         
         ttk.Label(param_frame, text="相似度閾值 (0.0-1.0)：").pack(anchor='w')
         ttk.Scale(param_frame, from_=0.0, to=1.0, variable=self.similarity_threshold, orient='horizontal').pack(fill='x', pady=(5, 5))
@@ -2225,6 +2369,7 @@ class MaiAgentValidatorGUI:
         
         ttk.Button(button_frame, text="開啟結果文件", command=self.open_results_file).pack(side='left')
         ttk.Button(button_frame, text="開啟結果資料夾", command=self.open_results_folder).pack(side='left', padx=(10, 0))
+        ttk.Button(button_frame, text="輸出 Excel", command=self.export_to_excel).pack(side='left', padx=(10, 0))
         ttk.Button(button_frame, text="檢視日誌統計", command=self.show_log_stats).pack(side='left', padx=(10, 0))
         
         # 詳細結果
@@ -2275,7 +2420,7 @@ class MaiAgentValidatorGUI:
                 asyncio.set_event_loop(loop)
                 
                 async def test():
-                    async with MaiAgentApiClient(self.api_base_url.get(), self.api_key.get(), None) as client:
+                    async with MaiAgentApiClient(self.api_base_url.get(), self.api_key.get(), self.api_logger_callback) as client:
                         chatbots = await client.get_chatbots()
                         return len(chatbots)
                 
@@ -2302,7 +2447,7 @@ class MaiAgentValidatorGUI:
                 asyncio.set_event_loop(loop)
                 
                 async def fetch():
-                    async with MaiAgentApiClient(self.api_base_url.get(), self.api_key.get(), None) as client:
+                    async with MaiAgentApiClient(self.api_base_url.get(), self.api_key.get(), self.api_logger_callback) as client:
                         return await client.get_chatbots()
                 
                 chatbots = loop.run_until_complete(fetch())
@@ -2392,9 +2537,9 @@ class MaiAgentValidatorGUI:
             self.log_info("計算統計結果...")
             stats = self.calculate_statistics(results)
             
-            # 輸出結果
-            output_file = f"validation_results_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            self.log_info(f"匯出結果到: {output_file}")
+            # 輸出結果（預設為 CSV 格式）
+            output_file = f"validation_results_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            self.log_info(f"匯出結果到 CSV: {output_file}")
             self.export_results(results, output_file, stats)
             
             # 更新 UI
@@ -2457,7 +2602,8 @@ class MaiAgentValidatorGUI:
                     問題描述=str(row[question_column]),  # 使用動態檢測到的欄位名稱
                     建議_or_正確答案=str(row.get('建議 or 正確答案 (if have)', '')),
                     應參考的文件=str(row.get('應參考的文件', '')),
-                    應參考的文件段落=str(row.get('應參考的文件段落', ''))
+                    應參考的文件段落=str(row.get('應參考的文件段落', '')),
+                    是否檢索KM推薦=str(row.get('是否檢索KM推薦', ''))  # 新增欄位
                 )
                 validation_rows.append(validation_row)
                 
@@ -2469,9 +2615,32 @@ class MaiAgentValidatorGUI:
         
     async def process_validation(self, validation_data):
         """處理驗證 - 支援併發處理多個提問者"""
-        # 按提問者分組
-        user_groups = {}
+        # 篩選需要檢索KM推薦的記錄
+        filtered_data = []
+        skipped_count = 0
+        
         for row in validation_data:
+            if row.是否檢索KM推薦.strip() == "是":
+                filtered_data.append(row)
+            else:
+                skipped_count += 1
+                # 為跳過的記錄設置預設值
+                row.AI助理回覆 = "跳過驗證（未標記為檢索KM推薦）"
+                row.引用節點是否命中 = "跳過"
+                row.參考文件是否正確 = "跳過"
+                row.回覆是否滿意 = "跳過"
+        
+        self.log_info(f"總共 {len(validation_data)} 筆記錄")
+        self.log_info(f"需要驗證的記錄: {len(filtered_data)} 筆（標記為「是」）")
+        self.log_info(f"跳過的記錄: {skipped_count} 筆（未標記為「是」）")
+        
+        if len(filtered_data) == 0:
+            self.log_warning("沒有標記為「是」的記錄需要驗證")
+            return validation_data  # 返回原始數據（包含跳過的記錄）
+        
+        # 按提問者分組（只處理需要驗證的記錄）
+        user_groups = {}
+        for row in filtered_data:
             user = row.提問者
             if user not in user_groups:
                 user_groups[user] = []
@@ -2488,7 +2657,7 @@ class MaiAgentValidatorGUI:
         # 創建結果字典，用於快速查找
         results_dict = {}
         
-        async with MaiAgentApiClient(self.api_base_url.get(), self.api_key.get(), None) as client:
+        async with MaiAgentApiClient(self.api_base_url.get(), self.api_key.get(), self.api_logger_callback) as client:
             # 使用 Semaphore 控制併發數量
             semaphore = asyncio.Semaphore(max_concurrent_users)
             
@@ -2501,23 +2670,37 @@ class MaiAgentValidatorGUI:
             # 併發執行所有提問者的任務
             await asyncio.gather(*tasks, return_exceptions=True)
         
-        # 按原始順序整理結果
+        # 按原始順序整理結果（包含所有記錄：驗證的和跳過的）
         results = []
         for row in validation_data:
             if row.編號 in results_dict:
+                # 使用驗證結果
                 results.append(results_dict[row.編號])
             else:
-                # 如果沒找到結果（可能因為停止或錯誤），使用原始數據並添加必要屬性
-                row.AI助理回覆 = "未處理"
-                
-                # 確保未處理的 row 具有所有統計屬性
-                row.precision = 0.0
-                row.recall = 0.0
-                row.f1_score = 0.0
-                row.hit_rate = 0.0
-                row.引用節點是否命中 = "否"
-                row.參考文件是否正確 = "否"
-                row.回覆是否滿意 = "否"
+                # 檢查是否為跳過的記錄
+                if row.是否檢索KM推薦.strip() != "是":
+                    # 已經在篩選階段設置了跳過狀態，直接使用
+                    # 確保跳過的記錄具有所有統計屬性
+                    row.precision = 0.0
+                    row.recall = 0.0
+                    row.f1_score = 0.0
+                    row.hit_rate = 0.0
+                else:
+                    # 標記為「是」但未處理的記錄（可能因為停止或錯誤）
+                    if not row.AI助理回覆 or row.AI助理回覆 == "":
+                        row.AI助理回覆 = "未處理（驗證中斷）"
+                    
+                    # 確保未處理的 row 具有所有統計屬性
+                    row.precision = 0.0
+                    row.recall = 0.0
+                    row.f1_score = 0.0
+                    row.hit_rate = 0.0
+                    if not row.引用節點是否命中:
+                        row.引用節點是否命中 = "否"
+                    if not row.參考文件是否正確:
+                        row.參考文件是否正確 = "否"
+                    if not row.回覆是否滿意:
+                        row.回覆是否滿意 = "否"
                 
                 results.append(row)
                     
@@ -2609,7 +2792,8 @@ class MaiAgentValidatorGUI:
             validation_row.應參考的文件段落,
             self.similarity_threshold.get(),
             actual_chunks_count,  # 使用實際回傳的節點數量
-            self.get_selected_separators()  # 使用用戶選擇的分隔符
+            self.get_selected_separators(),  # 使用用戶選擇的分隔符
+            self.similarity_mode.get()  # 使用用戶選擇的相似度計算模式
         )
         
         # 儲存詳細指標
@@ -2620,19 +2804,20 @@ class MaiAgentValidatorGUI:
         
         validation_row.引用節點是否命中 = "是" if citation_hit else "否"
         
-        file_match, _ = self.text_matcher.check_citation_file_match(
+        file_match, file_stats = self.text_matcher.check_citation_file_match(
             response.citations,
             validation_row.應參考的文件
         )
         validation_row.參考文件是否正確 = "是" if file_match else "否"
         
-        # 評估滿意度
-        if citation_hit and file_match:
-            validation_row.回覆是否滿意 = "是"
-        elif citation_hit or file_match:
-            validation_row.回覆是否滿意 = "部分滿意"
-        else:
-            validation_row.回覆是否滿意 = "否"
+        # 儲存參考文件命中統計數據
+        validation_row.參考文件命中率 = file_stats.get('hit_rate', 0.0)
+        validation_row.期望文件總數 = file_stats.get('total_expected', 0)
+        validation_row.命中文件數 = file_stats.get('total_matched', 0)
+        validation_row.未命中文件 = ', '.join(file_stats.get('unmatched_files', []))
+        
+        # 回覆是否滿意保持空白，供客戶手動輸入
+        # validation_row.回覆是否滿意 預設為空字串，不自動填寫
         
         # API 呼叫延遲（避免觸發限流）
         delay_time = self.api_delay.get()
@@ -2660,31 +2845,27 @@ class MaiAgentValidatorGUI:
             setattr(validation_row, field_name, content)
 
     def _add_citation_file_fields(self, validation_row, citations):
-        """動態添加參考文件欄位"""
-        # 收集所有文件信息
-        file_info_list = []
+        """動態添加參考文件欄位（僅顯示標籤，過濾重複）"""
+        # 收集所有標籤，自動過濾重複
+        unique_labels = set()
         
         for citation in citations:
-            filename = citation.get('filename', '未知文件')
             labels = citation.get('labels', [])
             
-            # 組合文件名和標籤
-            if labels:
-                label_names = [label.get('name', '') for label in labels if label.get('name')]
-                if label_names:
-                    file_info = f"{filename} (標籤: {', '.join(label_names)})"
-                else:
-                    file_info = filename
-            else:
-                file_info = filename
-            
-            file_info_list.append(file_info)
+            # 收集所有標籤名稱
+            for label in labels:
+                label_name = label.get('name', '').strip()
+                if label_name:  # 只添加非空標籤
+                    unique_labels.add(label_name)
         
-        # 為每個文件添加獨立欄位
-        for i, file_info in enumerate(file_info_list, 1):
+        # 將標籤轉換為排序的列表
+        label_list = sorted(list(unique_labels))
+        
+        # 為每個標籤添加獨立欄位
+        for i, label_name in enumerate(label_list, 1):
             chinese_num = self.get_chinese_number(i)
             field_name = f'參考文件{chinese_num}'
-            setattr(validation_row, field_name, file_info)
+            setattr(validation_row, field_name, label_name)
 
     def calculate_statistics(self, results):
         """計算增強統計結果"""
@@ -2702,7 +2883,11 @@ class MaiAgentValidatorGUI:
                 'total_expected_segments': 0,
                 'total_hit_segments': 0,
                 'total_retrieved_chunks': 0,
-                'total_relevant_chunks': 0
+                # 參考文件統計
+                'avg_file_hit_rate': 0.0,
+                'total_expected_files': 0,
+                'total_matched_files': 0,
+                'file_level_hit_rate': 0.0
             }
         
         # 基本統計
@@ -2733,6 +2918,11 @@ class MaiAgentValidatorGUI:
                     # 這裡只記錄有效的精確度和召回率
                     pass
         
+        # 計算參考文件統計
+        total_expected_files = sum(row.期望文件總數 for row in results)
+        total_matched_files = sum(row.命中文件數 for row in results)
+        total_file_hit_rate = sum(row.參考文件命中率 for row in results)
+        
         return {
             'total_queries': total_queries,
             'citation_hit_rate': citation_hits / total_queries * 100,
@@ -2746,103 +2936,336 @@ class MaiAgentValidatorGUI:
             'total_expected_segments': total_expected_segments,
             'total_hit_segments': total_hit_segments,
             'total_retrieved_chunks': total_retrieved_chunks,
-            'total_relevant_chunks': total_relevant_chunks,
+            # 新增參考文件統計
+            'avg_file_hit_rate': total_file_hit_rate / total_queries * 100,
+            'total_expected_files': total_expected_files,
+            'total_matched_files': total_matched_files,
+            'file_level_hit_rate': (total_matched_files / total_expected_files * 100) if total_expected_files > 0 else 0.0,
             'rag_mode_enabled': True  # 固定啟用 RAG 模式
         }
         
     def export_results(self, results, output_file, stats):
-        """輸出結果到 Excel（包含分割的段落欄位和動態引用節點/參考文件欄位）"""
+        """輸出結果到 CSV（包含分割的段落欄位和動態引用節點/參考文件欄位）"""
         selected_separators = self.get_selected_separators()
         output_data = []
+        failed_rows = 0
         
-        # 先分析所有行，找出最大段落數量
-        max_segments = 1
-        for row in results:
-            segments = self.split_segments_for_export(row.應參考的文件段落, selected_separators)
-            max_segments = max(max_segments, len(segments))
-        
-        # 分析所有行，找出最大引用節點和參考文件數量
-        max_citation_nodes = 0
-        max_citation_files = 0
-        
-        for row in results:
-            # 計算引用節點數量
-            citation_count = 0
-            for i in range(1, 20):  # 假設最多不會超過20個
-                chinese_num = self.get_chinese_number(i)
-                field_name = f'引用節點{chinese_num}'
-                if hasattr(row, field_name):
-                    citation_count = i
-                else:
-                    break
-            max_citation_nodes = max(max_citation_nodes, citation_count)
+        try:
+            # 先分析所有行，找出最大段落數量
+            max_segments = 1
+            for row in results:
+                try:
+                    segments = self.split_segments_for_export(row.應參考的文件段落, selected_separators)
+                    max_segments = max(max_segments, len(segments))
+                except Exception as e:
+                    self.log_warning(f"分析段落失敗 [{row.編號}]: {str(e)}")
+                    continue
             
-            # 計算參考文件數量
-            file_count = 0
-            for i in range(1, 20):  # 假設最多不會超過20個
-                chinese_num = self.get_chinese_number(i)
-                field_name = f'參考文件{chinese_num}'
-                if hasattr(row, field_name):
-                    file_count = i
-                else:
-                    break
-            max_citation_files = max(max_citation_files, file_count)
+            # 分析所有行，找出最大引用節點和參考文件數量
+            max_citation_nodes = 0
+            max_citation_files = 0
+            
+            for row in results:
+                try:
+                    # 計算引用節點數量
+                    citation_count = 0
+                    for i in range(1, 20):  # 假設最多不會超過20個
+                        chinese_num = self.get_chinese_number(i)
+                        field_name = f'引用節點{chinese_num}'
+                        if hasattr(row, field_name):
+                            citation_count = i
+                        else:
+                            break
+                    max_citation_nodes = max(max_citation_nodes, citation_count)
+                    
+                    # 計算參考文件數量
+                    file_count = 0
+                    for i in range(1, 20):  # 假設最多不會超過20個
+                        chinese_num = self.get_chinese_number(i)
+                        field_name = f'參考文件{chinese_num}'
+                        if hasattr(row, field_name):
+                            file_count = i
+                        else:
+                            break
+                    max_citation_files = max(max_citation_files, file_count)
+                except Exception as e:
+                    self.log_warning(f"分析引用節點失敗 [{row.編號}]: {str(e)}")
+                    continue
+            
+            self.log_info(f"檢測到最大段落數量: {max_segments}，引用節點數量: {max_citation_nodes}，參考文件數量: {max_citation_files}")
+            
+            for row in results:
+                try:
+                    # 清理和安全化字符串內容
+                    def safe_string(value):
+                        if value is None:
+                            return ''
+                        str_value = str(value)
+                        
+                        # 按正確順序轉義特殊字符，避免重複轉義
+                        str_value = str_value.replace('&', '&amp;')  # 首先處理 & 字符
+                        str_value = str_value.replace('<', '&lt;')   # 轉義小於號（防止 XML 標籤錯誤）
+                        str_value = str_value.replace('>', '&gt;')   # 轉義大於號
+                        str_value = str_value.replace('"', '&quot;') # 轉義雙引號
+                        
+                        # 移除可能造成 CSV 問題的字符
+                        str_value = str_value.replace('\r\n', '\n').replace('\r', '\n')
+                        
+                        # 限制超長內容
+                        if len(str_value) > 32000:  # Excel 單元格限制
+                            str_value = str_value[:32000] + "...(內容已截斷)"
+                        return str_value
+                    
+                    # 基本欄位
+                    row_data = {
+                        '編號': safe_string(row.編號),
+                        '提問者': safe_string(row.提問者),
+                        '問題描述': safe_string(row.問題描述),
+                        '是否檢索KM推薦': safe_string(row.是否檢索KM推薦),  # 新增欄位
+                        'AI 助理回覆': safe_string(row.AI助理回覆),
+                        '建議 or 正確答案 (if have)': safe_string(row.建議_or_正確答案),
+                        '應參考的文件': safe_string(row.應參考的文件),
+                        '應參考的文件段落(原始)': safe_string(row.應參考的文件段落),  # 保留原始完整內容
+                        '引用節點是否命中': safe_string(row.引用節點是否命中),
+                        '參考文件是否正確': safe_string(row.參考文件是否正確),
+                        '回覆是否滿意': safe_string(row.回覆是否滿意),
+                        # 參考文件詳細信息（不包含命中率）
+                        '期望文件總數': str(row.期望文件總數),
+                        '命中文件數': str(row.命中文件數),
+                        '未命中文件': safe_string(row.未命中文件)
+                    }
+                    
+                    # 添加動態引用節點欄位
+                    for i in range(1, max_citation_nodes + 1):
+                        chinese_num = self.get_chinese_number(i)
+                        field_name = f'引用節點{chinese_num}'
+                        content = getattr(row, field_name, '') if hasattr(row, field_name) else ''
+                        row_data[field_name] = safe_string(content)
+                    
+                    # 添加動態參考文件欄位
+                    for i in range(1, max_citation_files + 1):
+                        chinese_num = self.get_chinese_number(i)
+                        field_name = f'參考文件{chinese_num}'
+                        content = getattr(row, field_name, '') if hasattr(row, field_name) else ''
+                        row_data[field_name] = safe_string(content)
+                    
+                    # 分割段落並添加到獨立欄位
+                    segments = self.split_segments_for_export(row.應參考的文件段落, selected_separators)
+                    
+                    for i in range(max_segments):
+                        chinese_num = self.get_chinese_number(i + 1)
+                        column_name = f'應參考的文件段落({chinese_num})'
+                        
+                        if i < len(segments):
+                            row_data[column_name] = safe_string(segments[i])
+                        else:
+                            row_data[column_name] = ''  # 空欄位用於沒有那麼多段落的行
+                    
+                    output_data.append(row_data)
+                    
+                except Exception as e:
+                    failed_rows += 1
+                    self.log_error(f"處理驗證結果失敗 [{getattr(row, '編號', 'Unknown')}]: {str(e)}")
+                    self.log_error(f"錯誤詳情: {type(e).__name__}")
+                    continue
+            
+            # 確保輸出文件是 CSV 格式
+            if not output_file.lower().endswith('.csv'):
+                output_file = os.path.splitext(output_file)[0] + '.csv'
+            
+            # 輸出到 CSV
+            df = pd.DataFrame(output_data)
+            df.to_csv(output_file, index=False, encoding='utf-8-sig')  # 使用 BOM 確保中文正確顯示
+            self.output_file = output_file
+            
+            # 記錄分割統計
+            self.log_info(f"已匯出 {len(output_data)} 筆記錄到 CSV 檔案，最多 {max_segments} 個段落")
+            if failed_rows > 0:
+                self.log_warning(f"跳過 {failed_rows} 筆有問題的記錄")
+            self.log_info(f"使用的分隔符: {', '.join(selected_separators)}")
+            self.log_info(f"輸出檔案: {output_file}")
+            
+        except Exception as e:
+            self.log_error(f"匯出結果失敗: {str(e)}")
+            self.log_error(f"錯誤類型: {type(e).__name__}")
+            raise
+    
+    def export_excel(self, results, stats):
+        """輸出結果到 Excel 格式"""
+        try:
+            if not hasattr(self, 'output_file') or not self.output_file:
+                self.log_error("沒有可用的輸出檔案路徑")
+                messagebox.showerror("錯誤", "沒有可用的輸出檔案路徑")
+                return
+            
+            # 生成 Excel 檔案路徑
+            csv_file = self.output_file
+            excel_file = os.path.splitext(csv_file)[0] + '.xlsx'
+            
+            self.log_info(f"開始輸出 Excel 檔案: {excel_file}")
+            
+            selected_separators = self.get_selected_separators()
+            output_data = []
+            failed_rows = 0
+            
+            # 先分析所有行，找出最大段落數量
+            max_segments = 1
+            for row in results:
+                try:
+                    segments = self.split_segments_for_export(row.應參考的文件段落, selected_separators)
+                    max_segments = max(max_segments, len(segments))
+                except Exception as e:
+                    self.log_warning(f"Excel 輸出 - 分析段落失敗 [{row.編號}]: {str(e)}")
+                    continue
+            
+            # 分析所有行，找出最大引用節點和參考文件數量
+            max_citation_nodes = 0
+            max_citation_files = 0
+            
+            for row in results:
+                try:
+                    # 計算引用節點數量
+                    citation_count = 0
+                    for i in range(1, 20):
+                        chinese_num = self.get_chinese_number(i)
+                        field_name = f'引用節點{chinese_num}'
+                        if hasattr(row, field_name):
+                            citation_count = i
+                        else:
+                            break
+                    max_citation_nodes = max(max_citation_nodes, citation_count)
+                    
+                    # 計算參考文件數量
+                    file_count = 0
+                    for i in range(1, 20):
+                        chinese_num = self.get_chinese_number(i)
+                        field_name = f'參考文件{chinese_num}'
+                        if hasattr(row, field_name):
+                            file_count = i
+                        else:
+                            break
+                    max_citation_files = max(max_citation_files, file_count)
+                except Exception as e:
+                    self.log_warning(f"Excel 輸出 - 分析引用節點失敗 [{row.編號}]: {str(e)}")
+                    continue
+            
+            for row in results:
+                try:
+                    # Excel 安全化字符串內容
+                    def excel_safe_string(value):
+                        if value is None:
+                            return ''
+                        str_value = str(value)
+                        
+                        # 按正確順序轉義特殊字符，避免重複轉義
+                        str_value = str_value.replace('&', '&amp;')  # 首先處理 & 字符
+                        str_value = str_value.replace('<', '&lt;')   # 轉義小於號（防止 XML 標籤錯誤）
+                        str_value = str_value.replace('>', '&gt;')   # 轉義大於號
+                        str_value = str_value.replace('"', '&quot;') # 轉義雙引號
+                        
+                        # 移除可能造成 Excel 問題的字符
+                        str_value = str_value.replace('\r\n', '\n').replace('\r', '\n')
+                        
+                        # Excel 特殊字符處理
+                        if str_value.startswith('='):
+                            str_value = "'" + str_value  # 防止被解釋為公式
+                        if str_value.startswith('+') or str_value.startswith('-') or str_value.startswith('@'):
+                            str_value = "'" + str_value  # 防止被解釋為公式或指令
+                        
+                        # 限制超長內容
+                        if len(str_value) > 32000:  # Excel 單元格限制
+                            str_value = str_value[:32000] + "...(內容已截斷)"
+                        return str_value
+                    
+                    # 基本欄位
+                    row_data = {
+                        '編號': excel_safe_string(row.編號),
+                        '提問者': excel_safe_string(row.提問者),
+                        '問題描述': excel_safe_string(row.問題描述),
+                        '是否檢索KM推薦': excel_safe_string(row.是否檢索KM推薦),  # 新增欄位
+                        'AI 助理回覆': excel_safe_string(row.AI助理回覆),
+                        '建議 or 正確答案 (if have)': excel_safe_string(row.建議_or_正確答案),
+                        '應參考的文件': excel_safe_string(row.應參考的文件),
+                        '應參考的文件段落(原始)': excel_safe_string(row.應參考的文件段落),
+                        '引用節點是否命中': excel_safe_string(row.引用節點是否命中),
+                        '參考文件是否正確': excel_safe_string(row.參考文件是否正確),
+                        '回覆是否滿意': excel_safe_string(row.回覆是否滿意)
+                    }
+                    
+                    # 添加動態引用節點欄位
+                    for i in range(1, max_citation_nodes + 1):
+                        chinese_num = self.get_chinese_number(i)
+                        field_name = f'引用節點{chinese_num}'
+                        content = getattr(row, field_name, '') if hasattr(row, field_name) else ''
+                        row_data[field_name] = excel_safe_string(content)
+                    
+                    # 添加動態參考文件欄位
+                    for i in range(1, max_citation_files + 1):
+                        chinese_num = self.get_chinese_number(i)
+                        field_name = f'參考文件{chinese_num}'
+                        content = getattr(row, field_name, '') if hasattr(row, field_name) else ''
+                        row_data[field_name] = excel_safe_string(content)
+                    
+                    # 分割段落並添加到獨立欄位
+                    segments = self.split_segments_for_export(row.應參考的文件段落, selected_separators)
+                    
+                    for i in range(max_segments):
+                        chinese_num = self.get_chinese_number(i + 1)
+                        column_name = f'應參考的文件段落({chinese_num})'
+                        
+                        if i < len(segments):
+                            row_data[column_name] = excel_safe_string(segments[i])
+                        else:
+                            row_data[column_name] = ''
+                    
+                    output_data.append(row_data)
+                    
+                except Exception as e:
+                    failed_rows += 1
+                    self.log_error(f"Excel 輸出 - 處理驗證結果失敗 [{getattr(row, '編號', 'Unknown')}]: {str(e)}")
+                    continue
+            
+            # 輸出到 Excel
+            df = pd.DataFrame(output_data)
+            df.to_excel(excel_file, index=False, engine='openpyxl')
+            
+            # 記錄統計
+            self.log_info(f"已輸出 {len(output_data)} 筆記錄到 Excel 檔案")
+            if failed_rows > 0:
+                self.log_warning(f"Excel 輸出時跳過 {failed_rows} 筆有問題的記錄")
+            self.log_info(f"Excel 檔案: {excel_file}")
+            
+            messagebox.showinfo("成功", f"Excel 檔案已成功輸出到：\n{excel_file}")
+            
+        except Exception as e:
+            error_msg = f"Excel 輸出失敗: {str(e)}"
+            self.log_error(error_msg)
+            self.log_error(f"錯誤類型: {type(e).__name__}")
+            messagebox.showerror("Excel 輸出錯誤", error_msg)
+    
+    def export_to_excel(self):
+        """觸發 Excel 輸出的按鈕回調"""
+        if not hasattr(self, 'latest_results') or not self.latest_results:
+            messagebox.showwarning("警告", "沒有可用的驗證結果數據，請先完成驗證")
+            return
         
-        self.log_info(f"檢測到最大段落數量: {max_segments}，引用節點數量: {max_citation_nodes}，參考文件數量: {max_citation_files}")
+        if not hasattr(self, 'latest_stats') or not self.latest_stats:
+            messagebox.showwarning("警告", "沒有可用的統計數據，請先完成驗證")
+            return
         
-        for row in results:
-            # 基本欄位
-            row_data = {
-                '編號': row.編號,
-                '提問者': row.提問者,
-                '問題描述': row.問題描述,
-                'AI 助理回覆': row.AI助理回覆,
-                '建議 or 正確答案 (if have)': row.建議_or_正確答案,
-                '應參考的文件': row.應參考的文件,
-                '應參考的文件段落(原始)': row.應參考的文件段落,  # 保留原始完整內容
-                '引用節點是否命中': row.引用節點是否命中,
-                '參考文件是否正確': row.參考文件是否正確,
-                '回覆是否滿意': row.回覆是否滿意
-            }
-            
-            # 添加動態引用節點欄位
-            for i in range(1, max_citation_nodes + 1):
-                chinese_num = self.get_chinese_number(i)
-                field_name = f'引用節點{chinese_num}'
-                content = getattr(row, field_name, '') if hasattr(row, field_name) else ''
-                row_data[field_name] = content
-            
-            # 添加動態參考文件欄位
-            for i in range(1, max_citation_files + 1):
-                chinese_num = self.get_chinese_number(i)
-                field_name = f'參考文件{chinese_num}'
-                content = getattr(row, field_name, '') if hasattr(row, field_name) else ''
-                row_data[field_name] = content
-            
-            # 分割段落並添加到獨立欄位
-            segments = self.split_segments_for_export(row.應參考的文件段落, selected_separators)
-            
-            for i in range(max_segments):
-                chinese_num = self.get_chinese_number(i + 1)
-                column_name = f'應參考的文件段落({chinese_num})'
-                
-                if i < len(segments):
-                    row_data[column_name] = segments[i]
-                else:
-                    row_data[column_name] = ''  # 空欄位用於沒有那麼多段落的行
-            
-            output_data.append(row_data)
-        
-        df = pd.DataFrame(output_data)
-        df.to_excel(output_file, index=False, engine='openpyxl')
-        self.output_file = output_file
-        
-        # 記錄分割統計
-        self.log_info(f"已匯出 {len(results)} 筆記錄，最多 {max_segments} 個段落")
-        self.log_info(f"使用的分隔符: {', '.join(selected_separators)}")
+        try:
+            self.export_excel(self.latest_results, self.latest_stats)
+        except Exception as e:
+            error_msg = f"Excel 輸出過程發生錯誤：{str(e)}"
+            self.log_error(error_msg)
+            messagebox.showerror("Excel 輸出錯誤", error_msg)
         
     def show_results(self, results, stats, output_file):
         """顯示增強結果"""
+        # 保存最新的結果數據，用於 Excel 輸出
+        self.latest_results = results
+        self.latest_stats = stats
+        
         # 切換到結果頁面
         notebook = self.root.nametowidget(self.root.winfo_children()[0])
         notebook.select(2)  # 選擇結果頁面
@@ -2861,16 +3284,17 @@ class MaiAgentValidatorGUI:
 平均 Precision: {stats['avg_precision']:.2f}%
 平均 Recall: {stats['avg_recall']:.2f}%
 平均 F1-Score: {stats['avg_f1_score']:.2f}%
-平均段落命中率: {stats['avg_hit_rate']:.2f}%
 
 === 段落級統計 ===
 總預期段落數: {stats['total_expected_segments']}
 命中段落數: {stats['total_hit_segments']}
 總檢索塊數: {stats['total_retrieved_chunks']}
-相關塊數: {stats['total_relevant_chunks']}
 
-=== 文件匹配 ===
+=== 文件匹配統計 ===
 參考文件正確率: {stats['file_match_rate']:.2f}%
+文件級整體命中率: {stats['file_level_hit_rate']:.2f}%
+總期望文件數: {stats['total_expected_files']}
+總命中文件數: {stats['total_matched_files']}
 
 結果已輸出到: {output_file}
 """
@@ -3147,16 +3571,7 @@ TOP 10 Hit Rate: {stats['top_10_hit_rate']:.2f}%
         try:
             log_dir = Path("logs")
             if log_dir.exists():
-                import subprocess
-                import sys
-                
-                if sys.platform == "win32":
-                    os.startfile(log_dir)
-                elif sys.platform == "darwin":  # macOS
-                    subprocess.run(["open", str(log_dir)])
-                else:  # Linux
-                    subprocess.run(["xdg-open", str(log_dir)])
-                    
+                self._open_file_or_folder(str(log_dir))
                 self.log_info("已開啟日誌資料夾")
             else:
                 self.log_warning("日誌資料夾不存在")
@@ -3523,14 +3938,31 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
     def open_results_file(self):
         """開啟結果文件"""
         if hasattr(self, 'output_file') and os.path.exists(self.output_file):
-            os.startfile(self.output_file)
+            self._open_file_or_folder(self.output_file)
         else:
             messagebox.showwarning("警告", "結果文件不存在")
             
     def open_results_folder(self):
         """開啟結果資料夾"""
         folder = os.path.dirname(os.path.abspath(self.output_file)) if hasattr(self, 'output_file') else os.getcwd()
-        os.startfile(folder)
+        self._open_file_or_folder(folder)
+    
+    def _open_file_or_folder(self, path):
+        """跨平台開啟檔案或資料夾"""
+        try:
+            system = platform.system()
+            if system == "Windows":
+                os.startfile(path)
+            elif system == "Darwin":  # macOS
+                subprocess.call(["open", path])
+            elif system == "Linux":
+                subprocess.call(["xdg-open", path])
+            else:
+                self.log_warning(f"不支援的作業系統: {system}")
+                messagebox.showwarning("警告", f"無法在 {system} 系統上自動開啟檔案")
+        except Exception as e:
+            self.log_error(f"開啟檔案失敗: {str(e)}")
+            messagebox.showerror("錯誤", f"開啟檔案失敗: {str(e)}")
         
     def load_config(self):
         """載入配置"""
