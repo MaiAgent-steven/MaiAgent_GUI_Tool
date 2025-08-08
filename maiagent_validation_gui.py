@@ -7,7 +7,7 @@ MaiAgent Django 自動化驗證工具 - GUI 版本
 """
 
 # 版本信息
-__version__ = "4.0.1"
+__version__ = "4.2.6"
 __app_name__ = "MaiAgent 管理工具集"
 __build_date__ = "2025-01-27"
 __author__ = "MaiAgent Team"
@@ -96,6 +96,7 @@ class ValidationRow:
     建議_or_正確答案: str
     應參考的文件: str
     應參考的文件段落: str
+    應參考文件UUID: str = ""  # 新增欄位，用於UUID匹配
     是否檢索KM推薦: str = ""  # 新增欄位，控制是否進行驗證
     
     # API 回覆結果（自動填入）
@@ -118,6 +119,7 @@ class ValidationRow:
     參考文件命中率: float = 0.0
     期望文件總數: int = 0
     命中文件數: int = 0
+    命中文件: str = ""  # 新增：格式化的命中文件列表
     未命中文件: str = ""
     
     # 用於儲存原始 API 回傳數據
@@ -361,19 +363,26 @@ class MaiAgentApiClient:
         
         return all_chatbots
     
-    async def send_message(self, chatbot_id: str, message: str, conversation_id: Optional[str] = None, max_retries: int = 3) -> ApiResponse:
+    async def send_message(self, chatbot_id: str, message: str, conversation_id: Optional[str] = None, max_retries: int = 3, query_metadata: Optional[Dict] = None) -> ApiResponse:
         """發送訊息到指定的聊天機器人（具備重試機制）"""
         if not self.session:
             raise Exception("API Client session not initialized")
             
         url = self._build_api_url(f"chatbots/{chatbot_id}/completions/")
         
+        # 構建基本載荷
+        message_data = {
+            "content": message,
+            "attachments": []
+        }
+        
+        # 如果提供了 query_metadata，添加到 message 中
+        if query_metadata:
+            message_data["query_metadata"] = query_metadata
+        
         payload = {
             "conversation": conversation_id,
-            "message": {
-                "content": message,
-                "attachments": []
-            },
+            "message": message_data,
             "isStreaming": False
         }
         
@@ -1295,12 +1304,47 @@ class ConversationManager:
     
     def __init__(self):
         self.conversations: Dict[str, str] = {}
+        self.questioner_context: Dict[str, List[str]] = {}  # 儲存每個提問者的問題上下文
     
     def get_conversation_id(self, questioner: str) -> Optional[str]:
         return self.conversations.get(questioner)
     
     def set_conversation_id(self, questioner: str, conversation_id: str):
         self.conversations[questioner] = conversation_id
+    
+    def add_question_to_context(self, questioner: str, question: str):
+        """添加問題到提問者的上下文中"""
+        if questioner not in self.questioner_context:
+            self.questioner_context[questioner] = []
+        self.questioner_context[questioner].append(question)
+    
+    def get_context_questions(self, questioner: str) -> List[str]:
+        """獲取提問者的上下文問題列表"""
+        return self.questioner_context.get(questioner, [])
+    
+    def build_context_message(self, questioner: str, current_question: str) -> str:
+        """構建包含上下文的完整問題"""
+        previous_questions = self.get_context_questions(questioner)
+        
+        if not previous_questions:
+            # 如果沒有前面的問題，直接返回當前問題
+            return current_question
+        
+        # 構建上下文訊息
+        context_parts = []
+        context_parts.append("這是一系列相關的問題：")
+        context_parts.append("")
+        
+        # 添加前面的問題
+        for i, prev_question in enumerate(previous_questions, 1):
+            context_parts.append(f"問題 {i}：{prev_question}")
+        
+        # 添加當前問題
+        context_parts.append(f"問題 {len(previous_questions) + 1}：{current_question}")
+        context_parts.append("")
+        context_parts.append("請針對這一系列問題提供完整的回答，特別是最後一個問題。")
+        
+        return "\n".join(context_parts)
 
 
 class CSVParser:
@@ -1315,7 +1359,9 @@ class CSVParser:
         """解析 CSV 文件，返回成員列表和群組信息"""
         print(f"📄 正在解析 CSV 文件: {self.csv_file}")
         
-        with open(self.csv_file, 'r', encoding='utf-8-sig') as file:
+        # 使用編碼檢測讀取CSV文件
+        encoding = self._detect_file_encoding(self.csv_file)
+        with open(self.csv_file, 'r', encoding=encoding) as file:
             reader = csv.DictReader(file)
             
             for row in reader:
@@ -1364,6 +1410,41 @@ class CSVParser:
                     self.groups_info[group_name] = permissions
             else:
                 print(f"⚠️ 無法解析群組配置: {group_config}")
+    
+    def _detect_file_encoding(self, file_path):
+        """檢測文件編碼"""
+        import chardet
+        
+        # 常見編碼格式
+        encodings_to_try = ['utf-8-sig', 'utf-8', 'big5', 'gbk', 'cp950', 'cp1252']
+        
+        try:
+            with open(file_path, 'rb') as file:
+                raw_data = file.read()
+                detected = chardet.detect(raw_data)
+                detected_encoding = detected.get('encoding', '')
+                confidence = detected.get('confidence', 0)
+                
+                print(f"🔍 檢測到文件編碼: {detected_encoding} (信心度: {confidence:.2f})")
+                
+                if confidence > 0.7 and detected_encoding:
+                    return detected_encoding.lower()
+        except Exception as e:
+            print(f"編碼檢測失敗: {e}")
+        
+        # 逐一嘗試編碼
+        for encoding in encodings_to_try:
+            try:
+                with open(file_path, 'r', encoding=encoding) as test_file:
+                    test_file.read(1024)  # 讀取前1024字節測試
+                print(f"✅ 使用編碼: {encoding}")
+                return encoding
+            except UnicodeDecodeError:
+                continue
+        
+        # 默認返回utf-8-sig
+        print("⚠️ 無法確定編碼，使用默認: utf-8-sig")
+        return 'utf-8-sig'
 
 
 class BatchImportProcessor:
@@ -1724,7 +1805,7 @@ class EnhancedTextMatcher:
     
     @classmethod
     def check_citation_file_match(cls, citations: List[Dict], expected_files: str) -> Tuple[bool, Dict]:
-        """檢查參考文件是否正確（支援逗號和換行符分割，全部命中制）"""
+        """檢查參考文件是否正確（僅支援UUID匹配，逗號和換行符分割，全部命中制）"""
         if not citations or not expected_files:
             return False, {
                 "detail": "無引用文件或預期文件為空",
@@ -1748,27 +1829,25 @@ class EnhancedTextMatcher:
                 files_in_line = [f.strip() for f in line.split(',') if f.strip()]
                 expected_file_list.extend(files_in_line)
         
-        # 去除重複的文件名稱
+        # 去除重複的文件名稱/UUID
         expected_file_list = list(set(expected_file_list))
         
-        cited_files = []
+        # 收集引用文件的UUID
+        cited_uuids = []
         
         for citation in citations:
-            if 'filename' in citation:
-                cited_files.append(citation['filename'])
+            if 'id' in citation:
+                cited_uuids.append(citation['id'])
         
         # 記錄每個期望文件的匹配情況
         matched_expected_files = set()
         matches = []
         
         for expected_file in expected_file_list:
-            file_matched = False
-            for cited_file in cited_files:
-                if cls.contains_keywords(cited_file, expected_file) or cls.calculate_similarity(cited_file, expected_file) > 0.7:
-                    matches.append(f"{expected_file} -> {cited_file}")
-                    matched_expected_files.add(expected_file)
-                    file_matched = True
-                    break  # 每個期望文件只需要匹配一次
+            # 只進行UUID精確匹配
+            if expected_file in cited_uuids:
+                matches.append(f"{expected_file} -> UUID匹配")
+                matched_expected_files.add(expected_file)
         
         # 計算統計數據
         total_expected = len(expected_file_list)
@@ -1909,6 +1988,14 @@ class MaiAgentValidatorGUI:
         self.validation_data = []
         self.conversation_manager = ConversationManager()
         self.text_matcher = EnhancedTextMatcher()
+        
+        # query_metadata 相關參數
+        self.knowledge_base_id = tk.StringVar()
+        self.label_id = tk.StringVar()
+        self.enable_query_metadata = tk.BooleanVar(value=False)
+        
+        # 上下文組合相關參數
+        self.enable_context_combination = tk.BooleanVar(value=True)
         
         # 驗證控制變數
         self.validation_stopped = False
@@ -2140,6 +2227,88 @@ class MaiAgentValidatorGUI:
         ttk.Label(api_frame, text="API 金鑰：").pack(anchor='w')
         ttk.Entry(api_frame, textvariable=self.api_key, width=60, show="*").pack(fill='x', pady=(5, 0))
         
+        # Query Metadata 設定
+        query_metadata_frame = ttk.LabelFrame(padding_frame, text="查詢元數據設定 (Query Metadata)", padding=10)
+        query_metadata_frame.pack(fill='x', pady=(0, 10))
+        
+        # 啟用/停用 query_metadata
+        enable_checkbox = tk.Checkbutton(
+            query_metadata_frame,
+            text="啟用 Query Metadata（指定知識庫和標籤過濾）",
+            variable=self.enable_query_metadata,
+            indicatoron=1,
+            relief='flat',
+            borderwidth=0,
+            highlightthickness=0,
+            bg=self.bg_color,
+            activebackground=self.bg_color,
+            font=('Arial', 9),
+            cursor='hand2',
+            anchor='w',
+            pady=2,
+            command=self.on_query_metadata_toggle
+        )
+        enable_checkbox.pack(anchor='w', pady=(0, 10))
+        
+        # 知識庫ID輸入
+        self.kb_id_frame = ttk.Frame(query_metadata_frame)
+        self.kb_id_frame.pack(fill='x', pady=(0, 5))
+        
+        ttk.Label(self.kb_id_frame, text="知識庫 ID：").pack(anchor='w')
+        kb_id_entry = ttk.Entry(self.kb_id_frame, textvariable=self.knowledge_base_id, width=60)
+        kb_id_entry.pack(fill='x', pady=(5, 0))
+        
+        # 標籤ID輸入
+        self.label_id_frame = ttk.Frame(query_metadata_frame)
+        self.label_id_frame.pack(fill='x', pady=(0, 5))
+        
+        ttk.Label(self.label_id_frame, text="標籤 ID（選填）：").pack(anchor='w')
+        label_id_entry = ttk.Entry(self.label_id_frame, textvariable=self.label_id, width=60)
+        label_id_entry.pack(fill='x', pady=(5, 0))
+        
+        # 說明文字
+        help_text = ttk.Label(
+            query_metadata_frame,
+            text="  ↳ 知識庫ID和標籤ID用於限制RAG檢索範圍。不填寫標籤ID則使用知識庫所有內容。",
+            font=('Arial', 8),
+            foreground='gray'
+        )
+        help_text.pack(anchor='w', pady=(5, 0))
+        
+        # 初始狀態設定為停用
+        self.on_query_metadata_toggle()
+        
+        # 上下文組合設定
+        context_frame = ttk.LabelFrame(padding_frame, text="對話上下文設定", padding=10)
+        context_frame.pack(fill='x', pady=(0, 10))
+        
+        # 啟用/停用上下文組合
+        context_checkbox = tk.Checkbutton(
+            context_frame,
+            text="啟用同一提問者問題上下文組合",
+            variable=self.enable_context_combination,
+            indicatoron=1,
+            relief='flat',
+            borderwidth=0,
+            highlightthickness=0,
+            bg=self.bg_color,
+            activebackground=self.bg_color,
+            font=('Arial', 9),
+            cursor='hand2',
+            anchor='w',
+            pady=2
+        )
+        context_checkbox.pack(anchor='w', pady=(0, 5))
+        
+        # 說明文字
+        context_help = ttk.Label(
+            context_frame,
+            text="  ↳ 當同一提問者有多個問題時，在開始新對話時會將前面的問題一起發送給AI作為上下文",
+            font=('Arial', 8),
+            foreground='gray'
+        )
+        context_help.pack(anchor='w', pady=(0, 0))
+        
         # 驗證參數
         param_frame = ttk.LabelFrame(padding_frame, text="驗證參數", padding=10)
         param_frame.pack(fill='x', pady=(0, 10))
@@ -2306,6 +2475,9 @@ class MaiAgentValidatorGUI:
         self.stop_button = ttk.Button(control_frame, text="停止驗證", command=self.stop_validation, state='disabled')
         self.stop_button.pack(side='left', padx=(10, 0))
         
+        self.retry_failed_button = ttk.Button(control_frame, text="重測失敗問題", command=self.retry_failed_from_csv)
+        self.retry_failed_button.pack(side='left', padx=(10, 0))
+        
         # 進度顯示
         progress_frame = ttk.LabelFrame(padding_frame, text="進度", padding=10)
         progress_frame.pack(fill='x', pady=(0, 10))
@@ -2316,29 +2488,71 @@ class MaiAgentValidatorGUI:
         self.progress_label = ttk.Label(progress_frame, text="準備中...")
         self.progress_label.pack(anchor='w')
         
-        # 日誌顯示
-        log_frame = ttk.LabelFrame(padding_frame, text="執行日誌", padding=10)
+        # 日誌顯示（優化版）
+        log_frame = ttk.LabelFrame(padding_frame, text="📋 執行日誌", padding=10)
         log_frame.pack(fill='both', expand=True)
         
-        # 日誌控制按鈕
-        log_control_frame = ttk.Frame(log_frame)
-        log_control_frame.pack(fill='x', pady=(0, 5))
+        # 日誌控制按鈕（第一行）
+        log_control_frame1 = ttk.Frame(log_frame)
+        log_control_frame1.pack(fill='x', pady=(0, 5))
         
-        ttk.Button(log_control_frame, text="清空日誌", command=self.clear_log_display).pack(side='left')
-        ttk.Button(log_control_frame, text="匯出日誌", command=self.export_logs).pack(side='left', padx=(5, 0))
-        ttk.Button(log_control_frame, text="開啟日誌資料夾", command=self.open_log_folder).pack(side='left', padx=(5, 0))
+        ttk.Button(log_control_frame1, text="🗑️ 清空日誌", command=self.clear_log_display).pack(side='left')
+        ttk.Button(log_control_frame1, text="📤 匯出日誌", command=self.export_logs).pack(side='left', padx=(5, 0))
+        ttk.Button(log_control_frame1, text="📁 開啟日誌資料夾", command=self.open_log_folder).pack(side='left', padx=(5, 0))
+        
+        # 自動滾動控制
+        self.auto_scroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(log_control_frame1, text="🔄 自動滾動", variable=self.auto_scroll_var).pack(side='left', padx=(20, 0))
+        
+        # 日誌過濾控制（第二行）
+        log_control_frame2 = ttk.Frame(log_frame)
+        log_control_frame2.pack(fill='x', pady=(0, 5))
         
         # 日誌級別過濾
-        ttk.Label(log_control_frame, text="顯示級別:").pack(side='left', padx=(20, 5))
+        ttk.Label(log_control_frame2, text="🎚️ 顯示級別:").pack(side='left')
         self.log_level_var = tk.StringVar(value="INFO")
-        log_level_combo = ttk.Combobox(log_control_frame, textvariable=self.log_level_var, 
-                                      values=["DEBUG", "INFO", "WARNING", "ERROR"], 
-                                      width=10, state="readonly")
-        log_level_combo.pack(side='left')
+        log_level_combo = ttk.Combobox(log_control_frame2, textvariable=self.log_level_var, 
+                                      values=["ALL", "DEBUG", "INFO", "WARNING", "ERROR"], 
+                                      width=8, state="readonly")
+        log_level_combo.pack(side='left', padx=(5, 0))
         log_level_combo.bind('<<ComboboxSelected>>', self.on_log_level_changed)
         
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=15, state='disabled')
+        # 日誌類型過濾
+        ttk.Label(log_control_frame2, text="📂 日誌類型:").pack(side='left', padx=(15, 5))
+        self.log_type_var = tk.StringVar(value="ALL")
+        log_type_combo = ttk.Combobox(log_control_frame2, textvariable=self.log_type_var,
+                                     values=["ALL", "GUI", "API", "Validation", "Retry"],
+                                     width=8, state="readonly")
+        log_type_combo.pack(side='left')
+        log_type_combo.bind('<<ComboboxSelected>>', self.on_log_type_changed)
+        
+        # 搜索功能
+        ttk.Label(log_control_frame2, text="🔍 搜索:").pack(side='left', padx=(15, 5))
+        self.log_search_var = tk.StringVar()
+        search_entry = ttk.Entry(log_control_frame2, textvariable=self.log_search_var, width=15)
+        search_entry.pack(side='left')
+        search_entry.bind('<KeyRelease>', self.on_log_search_changed)
+        ttk.Button(log_control_frame2, text="❌", command=self.clear_log_search, width=3).pack(side='left', padx=(2, 0))
+        
+        # 統計信息
+        self.log_stats_label = ttk.Label(log_control_frame2, text="", font=('Arial', 8))
+        self.log_stats_label.pack(side='right')
+        
+        # 創建日誌文本框（優化版）
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=15, state='disabled', wrap='word')
         self.log_text.pack(fill='both', expand=True)
+        
+        # 配置日誌文本框的字體和顏色
+        self.setup_log_text_styling()
+        
+        # 初始化日誌統計
+        self.log_stats = {
+            'DEBUG': 0,
+            'INFO': 0,
+            'WARNING': 0,
+            'ERROR': 0,
+            'total': 0
+        }
         
     def create_results_tab(self, notebook):
         """創建結果標籤頁（帶滾動條）"""
@@ -2564,7 +2778,7 @@ class MaiAgentValidatorGUI:
         try:
             # 根據文件擴展名選擇適當的讀取方法
             if file_extension == '.csv':
-                df = pd.read_csv(file_path, encoding='utf-8')
+                df = self._read_csv_with_encoding_detection(file_path)
             elif file_extension in ['.xlsx', '.xls']:
                 df = pd.read_excel(file_path, engine='openpyxl' if file_extension == '.xlsx' else None)
             else:
@@ -2603,6 +2817,7 @@ class MaiAgentValidatorGUI:
                     建議_or_正確答案=str(row.get('建議 or 正確答案 (if have)', '')),
                     應參考的文件=str(row.get('應參考的文件', '')),
                     應參考的文件段落=str(row.get('應參考的文件段落', '')),
+                    應參考文件UUID=str(row.get('應參考文件UUID', '')),  # 新增UUID欄位
                     是否檢索KM推薦=str(row.get('是否檢索KM推薦', ''))  # 新增欄位
                 )
                 validation_rows.append(validation_row)
@@ -2615,6 +2830,11 @@ class MaiAgentValidatorGUI:
         
     async def process_validation(self, validation_data):
         """處理驗證 - 支援併發處理多個提問者"""
+        # 清空對話管理器的上下文（新的驗證開始）
+        self.conversation_manager.conversations.clear()
+        self.conversation_manager.questioner_context.clear()
+        self.log_info("已清空對話上下文，開始新的驗證")
+        
         # 篩選需要檢索KM推薦的記錄
         filtered_data = []
         skipped_count = 0
@@ -2669,6 +2889,9 @@ class MaiAgentValidatorGUI:
             
             # 併發執行所有提問者的任務
             await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # === 重試失敗問題檢查與重新測試 ===
+            await self.check_and_retry_failed_questions(client, filtered_data, results_dict, progress_lock, len(validation_data))
         
         # 按原始順序整理結果（包含所有記錄：驗證的和跳過的）
         results = []
@@ -2705,6 +2928,1010 @@ class MaiAgentValidatorGUI:
                 results.append(row)
                     
         return results
+    
+    async def check_and_retry_failed_questions(self, client, filtered_data, results_dict, progress_lock, total_questions):
+        """檢查並重試失敗的問題"""
+        if self.validation_stopped:
+            self.log_info("驗證已停止，跳過失敗問題重試檢查")
+            return
+            
+        # 識別失敗的問題
+        failed_questions = []
+        for row in filtered_data:
+            if row.編號 in results_dict:
+                result = results_dict[row.編號]
+                # 檢查是否為重試失敗的問題
+                if (hasattr(result, 'AI助理回覆') and 
+                    result.AI助理回覆 and 
+                    (result.AI助理回覆.startswith("錯誤:") or 
+                     "API 請求在" in result.AI助理回覆 or 
+                     "次重試後仍然失敗" in result.AI助理回覆)):
+                    failed_questions.append(row)
+            else:
+                # 未處理的問題也算失敗
+                failed_questions.append(row)
+        
+        if not failed_questions:
+            self.log_info("✅ 所有問題都已成功驗證，無需重試")
+            return
+        
+        # 記錄失敗問題統計
+        self.log_warning(f"🔍 發現 {len(failed_questions)} 個失敗問題，準備進行重試...")
+        
+        # 按提問者分組失敗問題
+        failed_user_groups = {}
+        for row in failed_questions:
+            user = row.提問者
+            if user not in failed_user_groups:
+                failed_user_groups[user] = []
+            failed_user_groups[user].append(row)
+        
+        self.log_info(f"📊 失敗問題分布：{', '.join([f'{user}({len(questions)}題)' for user, questions in failed_user_groups.items()])}")
+        
+        # 重試配置：降低併發數，增加延遲和重試次數
+        retry_max_concurrent = max(1, self.max_concurrent.get() // 2)  # 降低併發數
+        retry_delay = self.api_delay.get() * 2  # 增加延遲
+        retry_attempts = min(self.max_retries.get() + 2, 8)  # 增加重試次數，最多8次
+        
+        self.log_info(f"🔄 重試配置：併發數={retry_max_concurrent}, 延遲={retry_delay}秒, 重試次數={retry_attempts}")
+        
+        # 使用更保守的併發控制進行重試
+        retry_semaphore = asyncio.Semaphore(retry_max_concurrent)
+        retry_tasks = []
+        
+        for user, user_questions in failed_user_groups.items():
+            if self.validation_stopped:
+                break
+            task = self.retry_user_questions(client, user, user_questions, retry_semaphore, 
+                                           total_questions, progress_lock, results_dict, 
+                                           retry_delay, retry_attempts)
+            retry_tasks.append(task)
+        
+        if retry_tasks:
+            self.log_info(f"🚀 開始重試 {len(retry_tasks)} 個提問者的失敗問題...")
+            await asyncio.gather(*retry_tasks, return_exceptions=True)
+            
+            # 檢查重試結果
+            still_failed = []
+            retry_success = 0
+            for row in failed_questions:
+                if row.編號 in results_dict:
+                    result = results_dict[row.編號]
+                    if (hasattr(result, 'AI助理回覆') and 
+                        result.AI助理回覆 and 
+                        not (result.AI助理回覆.startswith("錯誤:") or 
+                             "API 請求在" in result.AI助理回覆 or 
+                             "次重試後仍然失敗" in result.AI助理回覆)):
+                        retry_success += 1
+                    else:
+                        still_failed.append(row.編號)
+                else:
+                    still_failed.append(row.編號)
+            
+            # 報告重試結果
+            self.log_info(f"📈 重試完成統計：")
+            self.log_info(f"   ✅ 重試成功：{retry_success} 題")
+            self.log_info(f"   ❌ 仍然失敗：{len(still_failed)} 題")
+            
+            if still_failed:
+                self.log_warning(f"⚠️ 以下問題經重試後仍然失敗：{', '.join(still_failed[:10])}" + 
+                               (f" 等{len(still_failed)}題" if len(still_failed) > 10 else ""))
+            else:
+                self.log_info("🎉 所有失敗問題都已成功重試完成！")
+        else:
+            self.log_warning("重試任務創建失敗或驗證已停止")
+    
+    async def retry_user_questions(self, client, user, user_questions, semaphore, total_questions, 
+                                 progress_lock, results_dict, retry_delay, retry_attempts):
+        """重試特定提問者的失敗問題"""
+        async with semaphore:
+            if self.validation_stopped:
+                return
+                
+            self.log_info(f"🔄 開始重試提問者 '{user}' 的 {len(user_questions)} 個失敗問題")
+            
+            for row in user_questions:
+                if self.validation_stopped:
+                    break
+                    
+                try:
+                    # 清除之前的錯誤狀態
+                    row.AI助理回覆 = ""
+                    row.引用節點是否命中 = ""
+                    row.參考文件是否正確 = ""
+                    
+                    # 使用更保守的重試設定處理問題
+                    result = await self.process_single_question_with_retry(
+                        client, row, retry_attempts, retry_delay)
+                    
+                    # 更新結果
+                    async with progress_lock:
+                        # 標記為重試成功
+                        result._retry_info = "重試成功"
+                        results_dict[row.編號] = result
+                        
+                        # 更新進度顯示（重試）
+                        progress_msg = f"[重試-{user}] 完成問題 {row.編號} | 失敗問題重試中"
+                        self.root.after(0, lambda msg=progress_msg: self.update_progress(
+                            self.completed_questions, total_questions, msg))
+                    
+                    self.log_validation_result(row.編號, True, 
+                                             f"[重試-{user}] 重試成功，回覆長度: {len(result.AI助理回覆)} 字元")
+                    
+                except Exception as e:
+                    self.log_error(f"重試提問者 '{user}' 的問題 {row.編號} 仍然失敗: {str(e)}", 'Retry')
+                    
+                    # 標記為最終失敗
+                    async with progress_lock:
+                        row.AI助理回覆 = f"重試失敗: {str(e)}"
+                        row.precision = 0.0
+                        row.recall = 0.0
+                        row.f1_score = 0.0
+                        row.hit_rate = 0.0
+                        row.引用節點是否命中 = "否"
+                        row.參考文件是否正確 = "否"
+                        row.回覆是否滿意 = "否"
+                        
+                        results_dict[row.編號] = row
+                        
+                        progress_msg = f"[重試-{user}] 問題 {row.編號} 最終失敗 | 失敗問題重試中"
+                        self.root.after(0, lambda msg=progress_msg: self.update_progress(
+                            self.completed_questions, total_questions, msg))
+                
+                # 重試間隔延遲
+                if not self.validation_stopped:
+                    await asyncio.sleep(retry_delay)
+            
+            self.log_info(f"🏁 提問者 '{user}' 的失敗問題重試完成")
+    
+    async def process_single_question_with_retry(self, client, validation_row, max_retries, delay):
+        """使用自定義重試參數處理單個問題"""
+        # 獲取或創建對話
+        conversation_id = self.conversation_manager.get_conversation_id(validation_row.提問者)
+        
+        # 構建要發送的問題內容（重試時使用原始問題，因為上下文已經在初次處理時建立）
+        message_content = validation_row.問題描述
+        
+        # 如果這是重試且沒有對話ID，說明是重新開始對話，需要構建上下文
+        if conversation_id is None and self.enable_context_combination.get():
+            # 檢查是否有之前的問題需要組合（排除當前問題本身）
+            previous_questions = self.conversation_manager.get_context_questions(validation_row.提問者)
+            # 移除最後一個問題（當前問題），只使用前面的問題作為上下文
+            if previous_questions and len(previous_questions) > 1:
+                context_questions = previous_questions[:-1]  # 排除當前問題
+                if context_questions:
+                    context_parts = []
+                    context_parts.append("這是一系列相關的問題：")
+                    context_parts.append("")
+                    
+                    # 添加前面的問題
+                    for i, prev_question in enumerate(context_questions, 1):
+                        context_parts.append(f"問題 {i}：{prev_question}")
+                    
+                    # 添加當前問題
+                    context_parts.append(f"問題 {len(context_questions) + 1}：{validation_row.問題描述}")
+                    context_parts.append("")
+                    context_parts.append("請針對這一系列問題提供完整的回答，特別是最後一個問題。")
+                    
+                    message_content = "\n".join(context_parts)
+                    
+                    self.log_info(
+                        f"重試時為提問者 '{validation_row.提問者}' 重新構建上下文，包含 {len(context_questions)} 個前面的問題", 
+                        'Validation'
+                    )
+        
+        # 構建 query_metadata（如果啟用）
+        query_metadata = None
+        if self.enable_query_metadata.get() and self.knowledge_base_id.get().strip():
+            knowledge_bases = [
+                {
+                    "knowledge_base_id": self.knowledge_base_id.get().strip(),
+                    "has_user_selected_all": True
+                }
+            ]
+            
+            query_metadata = {
+                "knowledge_bases": knowledge_bases
+            }
+            
+            # 如果提供了標籤ID，添加標籤過濾
+            if self.label_id.get().strip():
+                query_metadata["label_relations"] = {
+                    "operator": "OR",
+                    "conditions": [
+                        {"label_id": self.label_id.get().strip()}
+                    ]
+                }
+        
+        # 發送問題（使用自定義重試機制）
+        response = await client.send_message(
+            self.selected_chatbot_id,
+            message_content,  # 使用構建的內容
+            conversation_id,
+            max_retries=max_retries,
+            query_metadata=query_metadata
+        )
+        
+        # 設定對話 ID（如果是新對話）
+        if not conversation_id and response.conversation_id:
+            self.conversation_manager.set_conversation_id(validation_row.提問者, response.conversation_id)
+        
+        # 進行 RAG 增強驗證
+        actual_chunks_count = len(response.citations) if response.citations else 0
+        citation_hit, rag_metrics = self.text_matcher.check_rag_enhanced_hit(
+            response.citations,
+            validation_row.應參考的文件段落,
+            self.similarity_threshold.get(),
+            actual_chunks_count,  # 使用實際回傳的節點數量
+            self.get_selected_separators(),  # 使用用戶選擇的分隔符
+            self.similarity_mode.get()  # 使用用戶選擇的相似度計算模式
+        )
+        
+        # 更新驗證行的結果
+        validation_row.AI助理回覆 = response.content
+        validation_row.precision = rag_metrics['precision']
+        validation_row.recall = rag_metrics['recall']
+        validation_row.f1_score = rag_metrics['f1_score']
+        validation_row.hit_rate = rag_metrics['hit_rate']
+        validation_row.引用節點是否命中 = "是" if citation_hit else "否"
+        
+        # 僅使用應參考文件UUID進行匹配
+        expected_files = validation_row.應參考文件UUID.strip()
+        
+        if expected_files:
+            file_match, file_stats = self.text_matcher.check_citation_file_match(
+                response.citations,
+                expected_files
+            )
+            validation_row.參考文件是否正確 = "是" if file_match else "否"
+        else:
+            # 如果沒有UUID，跳過文件匹配
+            file_match = False
+            file_stats = {
+                "detail": "無UUID資料，跳過文件匹配",
+                "total_expected": 0,
+                "total_matched": 0,
+                "hit_rate": 0.0,
+                "matched_files": [],
+                "unmatched_files": [],
+                "all_matched": False
+            }
+            validation_row.參考文件是否正確 = "未檢測"
+        
+        # 儲存參考文件命中統計數據
+        validation_row.參考文件命中率 = file_stats.get('hit_rate', 0.0)
+        validation_row.期望文件總數 = file_stats.get('total_expected', 0)
+        validation_row.命中文件數 = file_stats.get('total_matched', 0)
+        
+        # UUID格式的命中和未命中文件信息
+        matched_files = file_stats.get('matched_files', [])
+        validation_row.命中文件 = ', '.join(matched_files) if matched_files else ""
+        
+        unmatched_files = file_stats.get('unmatched_files', [])
+        validation_row.未命中文件 = ', '.join(unmatched_files) if unmatched_files else ""
+        
+        # 動態添加參考文件欄位
+        self._add_citation_file_fields(validation_row, response.citations)
+        
+        # 添加延遲
+        await asyncio.sleep(delay)
+        
+        return validation_row
+    
+    def _read_csv_with_encoding_detection(self, file_path):
+        """使用編碼檢測讀取CSV文件"""
+        import chardet
+        
+        # 常見的編碼格式列表（按優先級排序）
+        encodings_to_try = [
+            'utf-8-sig',    # UTF-8 with BOM (Excel常用)
+            'utf-8',        # 標準UTF-8
+            'big5',         # 繁體中文
+            'gbk',          # 簡體中文
+            'cp950',        # Windows繁體中文
+            'cp1252',       # Windows Western
+            'iso-8859-1',   # Latin-1
+            'ascii'         # 純ASCII
+        ]
+        
+        # 先嘗試檢測文件編碼
+        try:
+            with open(file_path, 'rb') as file:
+                raw_data = file.read()
+                detected = chardet.detect(raw_data)
+                detected_encoding = detected.get('encoding', '')
+                confidence = detected.get('confidence', 0)
+                
+                self.log_info(f"🔍 檢測到文件編碼: {detected_encoding} (信心度: {confidence:.2f})")
+                
+                # 如果檢測信心度較高，優先使用檢測到的編碼
+                if confidence > 0.7 and detected_encoding:
+                    encodings_to_try.insert(0, detected_encoding.lower())
+        except Exception as e:
+            self.log_warning(f"編碼檢測失敗: {e}")
+        
+        # 逐一嘗試不同編碼
+        last_error = None
+        for encoding in encodings_to_try:
+            try:
+                self.log_info(f"🔄 嘗試使用編碼: {encoding}")
+                df = pd.read_csv(file_path, encoding=encoding)
+                self.log_info(f"✅ 成功使用編碼 {encoding} 讀取文件")
+                return df
+            except UnicodeDecodeError as e:
+                last_error = e
+                self.log_warning(f"❌ 編碼 {encoding} 讀取失敗: {str(e)[:100]}")
+                continue
+            except Exception as e:
+                last_error = e
+                self.log_warning(f"❌ 使用編碼 {encoding} 時發生錯誤: {str(e)[:100]}")
+                continue
+        
+        # 如果所有編碼都失敗，拋出錯誤
+        raise ValueError(f"無法讀取CSV文件，已嘗試多種編碼格式。最後錯誤: {last_error}")
+    
+    def setup_log_text_styling(self):
+        """設置日誌文本框的樣式"""
+        # 設置字體
+        self.log_text.configure(font=('Consolas', 9))
+        
+        # 配置日誌級別顏色和樣式
+        self.log_text.tag_config('debug', foreground='#808080', font=('Consolas', 9, 'italic'))
+        self.log_text.tag_config('info', foreground='#000000', font=('Consolas', 9))
+        self.log_text.tag_config('warning', foreground='#FF8C00', font=('Consolas', 9, 'bold'))
+        self.log_text.tag_config('error', foreground='#DC143C', font=('Consolas', 9, 'bold'))
+        self.log_text.tag_config('critical', foreground='#8B0000', font=('Consolas', 9, 'bold'))
+        
+        # 配置日誌類型樣式
+        self.log_text.tag_config('gui_tag', foreground='#4169E1')
+        self.log_text.tag_config('api_tag', foreground='#32CD32')
+        self.log_text.tag_config('validation_tag', foreground='#FF69B4')
+        self.log_text.tag_config('retry_tag', foreground='#FFD700')
+        
+        # 配置時間戳樣式
+        self.log_text.tag_config('timestamp', foreground='#696969', font=('Consolas', 8))
+        
+        # 配置高亮搜索結果
+        self.log_text.tag_config('search_highlight', background='#FFFF00', foreground='#000000')
+    
+    def on_log_level_changed(self, event=None):
+        """日誌級別過濾變更處理"""
+        self.refresh_log_display()
+    
+    def on_log_type_changed(self, event=None):
+        """日誌類型過濾變更處理"""
+        self.refresh_log_display()
+    
+    def on_log_search_changed(self, event=None):
+        """搜索內容變更處理"""
+        self.refresh_log_display()
+    
+    def clear_log_search(self):
+        """清空搜索"""
+        self.log_search_var.set("")
+        self.refresh_log_display()
+    
+    def on_query_metadata_toggle(self):
+        """切換 Query Metadata 輸入欄位的啟用狀態"""
+        state = 'normal' if self.enable_query_metadata.get() else 'disabled'
+        
+        # 設定知識庫ID欄位
+        for widget in self.kb_id_frame.winfo_children():
+            if isinstance(widget, ttk.Entry):
+                widget.config(state=state)
+        
+        # 設定標籤ID欄位
+        for widget in self.label_id_frame.winfo_children():
+            if isinstance(widget, ttk.Entry):
+                widget.config(state=state)
+    
+    def refresh_log_display(self):
+        """刷新日誌顯示（根據過濾條件）"""
+        if not hasattr(self, 'log_text'):
+            return
+            
+        try:
+            # 獲取過濾條件
+            level_filter = self.log_level_var.get()
+            type_filter = self.log_type_var.get()
+            search_text = self.log_search_var.get().lower()
+            
+            # 清空當前顯示
+            self.log_text.config(state='normal')
+            self.log_text.delete('1.0', tk.END)
+            
+            # 重新顯示符合條件的日誌（這裡應該從內存中的日誌緩存重新載入）
+            # 由於原始實現沒有日誌緩存，這裡先實現基本功能
+            self.log_text.config(state='disabled')
+            
+            self.update_log_stats()
+            
+        except Exception as e:
+            pass  # 靜默處理刷新錯誤
+    
+    def update_log_stats(self):
+        """更新日誌統計信息"""
+        if hasattr(self, 'log_stats_label'):
+            stats_text = f"📊 DEBUG:{self.log_stats['DEBUG']} | INFO:{self.log_stats['INFO']} | WARNING:{self.log_stats['WARNING']} | ERROR:{self.log_stats['ERROR']} | 總計:{self.log_stats['total']}"
+            self.log_stats_label.config(text=stats_text)
+    
+    def get_log_level_icon(self, level):
+        """獲取日誌級別圖標"""
+        icons = {
+            'DEBUG': '🔍',
+            'INFO': 'ℹ️',
+            'WARNING': '⚠️',
+            'ERROR': '❌',
+            'CRITICAL': '🚨'
+        }
+        return icons.get(level.upper(), 'ℹ️')
+    
+    def get_log_type_icon(self, logger_name):
+        """獲取日誌類型圖標"""
+        icons = {
+            'GUI': '🖥️',
+            'API': '🌐',
+            'Validation': '✅',
+            'Retry': '🔄'
+        }
+        return icons.get(logger_name, '📝')
+    
+    def retry_failed_from_csv(self):
+        """從CSV文件載入並重測失敗問題"""
+        # 選擇之前的驗證結果CSV文件
+        from tkinter import filedialog, messagebox
+        
+        csv_file = filedialog.askopenfilename(
+            title="選擇驗證結果CSV文件",
+            filetypes=[
+                ("CSV files", "*.csv"),
+                ("All files", "*.*")
+            ]
+        )
+        
+        if not csv_file:
+            return
+        
+        try:
+            # 檢查API設定
+            if not self.api_key.get():
+                messagebox.showerror("錯誤", "請先在設定頁面中設定 API 金鑰")
+                return
+            
+            # 檢查是否選擇了Chatbot
+            selection = self.bot_listbox.curselection()
+            if not selection:
+                messagebox.showerror("錯誤", "請選擇聊天機器人")
+                return
+            
+            self.selected_chatbot_id = self.chatbots[selection[0]]['id']
+            
+            # 載入CSV並識別失敗問題
+            self.log_info(f"正在載入驗證結果文件: {csv_file}")
+            failed_data = self.load_failed_questions_from_csv(csv_file)
+            
+            if not failed_data:
+                messagebox.showinfo("資訊", "沒有發現需要重測的失敗問題")
+                return
+            
+            # 確認重測
+            result = messagebox.askyesno(
+                "確認重測", 
+                f"發現 {len(failed_data)} 個失敗問題需要重測。\n\n"
+                f"這將會：\n"
+                f"• 重新發送這些問題到AI助理\n"
+                f"• 使用當前的驗證參數設定\n"
+                f"• 覆蓋原始的失敗結果\n\n"
+                f"是否繼續？"
+            )
+            
+            if not result:
+                return
+            
+            # 重設驗證狀態
+            self.validation_stopped = False
+            self.completed_questions = 0
+            
+            # 更新UI狀態
+            self.retry_failed_button.config(state='disabled')
+            self.start_button.config(state='disabled')
+            self.stop_button.config(state='normal')
+            self.progress_bar['value'] = 0
+            self.progress_bar['maximum'] = len(failed_data)
+            self.progress_label.config(text="正在重測失敗問題...")
+            
+            # 清空日誌
+            self.log_text.config(state='normal')
+            self.log_text.delete(1.0, tk.END)
+            self.log_text.config(state='disabled')
+            
+            # 開始重測（傳遞原始CSV文件路徑用於整合）
+            import threading
+            self.original_csv_file = csv_file  # 保存原始CSV文件路徑
+            threading.Thread(target=self.run_retry_validation, args=(failed_data, csv_file), daemon=True).start()
+            
+        except Exception as e:
+            messagebox.showerror("錯誤", f"載入失敗問題時發生錯誤：{str(e)}")
+    
+    def load_failed_questions_from_csv(self, csv_file):
+        """從CSV文件中載入失敗的問題"""
+        import pandas as pd
+        
+        try:
+            # 讀取CSV文件（使用編碼檢測）
+            df = self._read_csv_with_encoding_detection(csv_file)
+            
+            # 檢查必要欄位
+            required_columns = ['編號', '提問者', 'AI助理回覆']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            if missing_columns:
+                raise ValueError(f"CSV文件缺少必要欄位: {', '.join(missing_columns)}")
+            
+            # 識別失敗問題
+            failed_rows = []
+            debug_info = []
+            
+            for _, row in df.iterrows():
+                ai_reply = str(row.get('AI助理回覆', ''))
+                row_id = str(row.get('編號', 'Unknown'))
+                
+                # 檢查是否為失敗問題（增強版）
+                failure_reasons = []
+                
+                if ai_reply.startswith("錯誤:"):
+                    failure_reasons.append("錯誤開頭")
+                if ai_reply.startswith("重試失敗:"):
+                    failure_reasons.append("重試失敗開頭")
+                if "API 請求在" in ai_reply:
+                    failure_reasons.append("API請求失敗")
+                if "次重試後仍然失敗" in ai_reply:
+                    failure_reasons.append("重試次數用盡")
+                if ai_reply.strip() == "" or ai_reply.lower() == "nan" or pd.isna(row.get('AI助理回覆')):
+                    failure_reasons.append("空回覆")
+                if ai_reply == "未處理（驗證中斷）":
+                    failure_reasons.append("驗證中斷")
+                if "連接" in ai_reply and ("錯誤" in ai_reply or "失敗" in ai_reply):
+                    failure_reasons.append("連接問題")
+                if "逾時" in ai_reply or "timeout" in ai_reply.lower():
+                    failure_reasons.append("逾時問題")
+                if "伺服器" in ai_reply and "錯誤" in ai_reply:
+                    failure_reasons.append("伺服器錯誤")
+                
+                is_failed = len(failure_reasons) > 0
+                
+                # 記錄調試信息
+                debug_info.append({
+                    '編號': row_id,
+                    '提問者': str(row.get('提問者', '')),
+                    'AI回覆前50字': ai_reply[:50] + ('...' if len(ai_reply) > 50 else ''),
+                    '是否失敗': is_failed,
+                    '失敗原因': ', '.join(failure_reasons) if failure_reasons else '無'
+                })
+                
+                if is_failed:
+                    # 查找問題描述欄位
+                    question_column = None
+                    for possible_name in ['問題描述', '對話內容', '問題內容', '內容']:
+                        if possible_name in df.columns:
+                            question_column = possible_name
+                            break
+                    
+                    if not question_column:
+                        self.log_warning(f"無法找到問題描述欄位，跳過問題 {row.get('編號', 'Unknown')}")
+                        continue
+                    
+                    # 創建ValidationRow對象
+                    validation_row = ValidationRow(
+                        編號=str(row.get('編號', '')),
+                        提問者=str(row.get('提問者', '')),
+                        問題描述=str(row.get(question_column, '')),
+                        建議_or_正確答案=str(row.get('建議 or 正確答案 (if have)', '')),
+                        應參考的文件=str(row.get('應參考的文件', '')),
+                        應參考的文件段落=str(row.get('應參考的文件段落', '')),
+                        是否檢索KM推薦=str(row.get('是否檢索KM推薦', '是'))  # 默認為是，因為是失敗問題
+                    )
+                    
+                    failed_rows.append(validation_row)
+            
+            # 輸出詳細的識別結果
+            self.log_info(f"🔍 CSV失敗問題識別結果：")
+            self.log_info(f"📊 總記錄數: {len(df)} 筆")
+            self.log_info(f"❌ 識別出失敗問題: {len(failed_rows)} 個")
+            self.log_info(f"✅ 成功問題: {len(df) - len(failed_rows)} 個")
+            
+            # 輸出每筆記錄的識別詳情
+            self.log_info("📋 詳細識別結果：")
+            for info in debug_info:
+                status_icon = "❌" if info['是否失敗'] else "✅"
+                self.log_info(f"{status_icon} {info['編號']} | {info['提問者']} | {info['失敗原因']} | {info['AI回覆前50字']}")
+            
+            self.log_info(f"🎯 總結：從 {len(df)} 筆記錄中識別出 {len(failed_rows)} 個失敗問題")
+            
+            # 顯示失敗問題的詳細信息
+            if failed_rows:
+                failed_users = {}
+                for row in failed_rows:
+                    user = row.提問者
+                    if user not in failed_users:
+                        failed_users[user] = 0
+                    failed_users[user] += 1
+                
+                user_info = ', '.join([f"{user}({count}題)" for user, count in failed_users.items()])
+                self.log_info(f"失敗問題分布: {user_info}")
+            
+            return failed_rows
+            
+        except Exception as e:
+            self.log_error(f"載入CSV文件失敗: {str(e)}")
+            raise
+    
+    def run_retry_validation(self, failed_data, original_csv_file):
+        """執行重測驗證（在背景執行緒中）"""
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            self.log_info(f"開始重測 {len(failed_data)} 個失敗問題...")
+            
+            # 執行重測驗證
+            results = loop.run_until_complete(self.process_retry_validation(failed_data))
+            
+            # 計算統計
+            self.log_info("計算重測統計結果...")
+            stats = self.calculate_retry_statistics(results)
+            
+            # 輸出整合結果（重測結果與原始CSV整合）
+            import os
+            import pandas as pd
+            base_name = os.path.splitext(original_csv_file)[0]
+            
+            # 生成兩個文件：重測結果和整合結果
+            retry_only_file = f"{base_name}_retry_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            integrated_file = f"{base_name}_integrated_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            
+            self.log_info(f"匯出重測結果到 CSV: {retry_only_file}")
+            self.export_retry_results(results, retry_only_file, stats)
+            
+            self.log_info(f"整合重測結果與原始數據: {integrated_file}")
+            self.export_integrated_results(results, original_csv_file, integrated_file, stats)
+            
+            # 更新 UI
+            self.log_info("重測完成，更新結果顯示")
+            self.root.after(0, lambda: self.show_retry_results(results, stats, retry_only_file, integrated_file))
+            
+        except Exception as e:
+            error_msg = str(e)
+            self.root.after(0, lambda: messagebox.showerror("錯誤", f"重測過程發生錯誤：{error_msg}"))
+        finally:
+            # 重設 UI 狀態
+            self.root.after(0, lambda: self.reset_retry_ui())
+    
+    async def process_retry_validation(self, failed_data):
+        """處理重測驗證 - 專門用於重測失敗問題"""
+        if not failed_data:
+            return []
+        
+        self.log_info(f"開始重測 {len(failed_data)} 個失敗問題")
+        
+        # 按提問者分組
+        user_groups = {}
+        for row in failed_data:
+            user = row.提問者
+            if user not in user_groups:
+                user_groups[user] = []
+            user_groups[user].append(row)
+        
+        self.log_info(f"重測目標: {len(user_groups)} 個提問者")
+        
+        # 使用更保守的併發設定進行重測
+        max_concurrent_users = max(1, self.max_concurrent.get() // 2)
+        self.log_info(f"重測併發設定: {max_concurrent_users} 個提問者")
+        
+        # 創建進度追蹤鎖
+        progress_lock = asyncio.Lock()
+        
+        # 創建結果字典
+        results_dict = {}
+        
+        async with MaiAgentApiClient(self.api_base_url.get(), self.api_key.get(), self.api_logger_callback) as client:
+            # 使用 Semaphore 控制併發數量
+            semaphore = asyncio.Semaphore(max_concurrent_users)
+            
+            # 創建每個提問者的處理任務
+            tasks = []
+            for user, user_questions in user_groups.items():
+                task = self.process_retry_user_questions(client, user, user_questions, semaphore, 
+                                                       len(failed_data), progress_lock, results_dict)
+                tasks.append(task)
+            
+            # 併發執行所有提問者的任務
+            await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # 整理結果
+        results = []
+        for row in failed_data:
+            if row.編號 in results_dict:
+                results.append(results_dict[row.編號])
+            else:
+                # 未處理的問題，保持原狀
+                row.AI助理回覆 = "重測未完成（可能被停止）"
+                results.append(row)
+        
+        return results
+    
+    async def process_retry_user_questions(self, client, user, user_questions, semaphore, 
+                                         total_questions, progress_lock, results_dict):
+        """處理重測用戶問題"""
+        async with semaphore:
+            if self.validation_stopped:
+                return
+                
+            self.log_info(f"🔄 開始重測提問者 '{user}' 的 {len(user_questions)} 個問題")
+            
+            for row in user_questions:
+                if self.validation_stopped:
+                    break
+                    
+                try:
+                    # 使用更保守的設定處理問題
+                    retry_delay = self.api_delay.get() * 2
+                    retry_attempts = min(self.max_retries.get() + 3, 10)
+                    
+                    result = await self.process_single_question_with_retry(
+                        client, row, retry_attempts, retry_delay)
+                    
+                    # 更新結果
+                    async with progress_lock:
+                        # 標記為重測成功
+                        result._retry_info = "CSV重測成功"
+                        results_dict[row.編號] = result
+                        self.completed_questions += 1
+                        
+                        # 更新進度顯示
+                        progress_msg = f"[重測-{user}] 完成問題 {row.編號} | 進度 {self.completed_questions}/{total_questions}"
+                        self.root.after(0, lambda msg=progress_msg: self.update_progress(
+                            self.completed_questions, total_questions, msg))
+                    
+                    self.log_validation_result(row.編號, True, 
+                                             f"[重測-{user}] 成功，回覆長度: {len(result.AI助理回覆)} 字元")
+                    
+                except Exception as e:
+                    self.log_error(f"重測提問者 '{user}' 的問題 {row.編號} 失敗: {str(e)}", 'Retry')
+                    
+                    # 標記為重測失敗
+                    async with progress_lock:
+                        row.AI助理回覆 = f"重測仍失敗: {str(e)}"
+                        row.precision = 0.0
+                        row.recall = 0.0
+                        row.f1_score = 0.0
+                        row.hit_rate = 0.0
+                        row.引用節點是否命中 = "否"
+                        row.參考文件是否正確 = "否"
+                        row.回覆是否滿意 = "否"
+                        
+                        results_dict[row.編號] = row
+                        self.completed_questions += 1
+                        
+                        progress_msg = f"[重測-{user}] 問題 {row.編號} 仍失敗 | 進度 {self.completed_questions}/{total_questions}"
+                        self.root.after(0, lambda msg=progress_msg: self.update_progress(
+                            self.completed_questions, total_questions, msg))
+                
+                # 重測間隔延遲
+                if not self.validation_stopped:
+                    await asyncio.sleep(retry_delay)
+            
+            self.log_info(f"🏁 提問者 '{user}' 的重測完成")
+    
+    def calculate_retry_statistics(self, results):
+        """計算重測統計結果"""
+        total_queries = len(results)
+        if total_queries == 0:
+            return {
+                'total_retry_queries': 0,
+                'retry_success_count': 0,
+                'retry_failed_count': 0,
+                'retry_success_rate': 0.0
+            }
+        
+        retry_success_count = 0
+        retry_failed_count = 0
+        
+        for row in results:
+            if hasattr(row, 'AI助理回覆') and row.AI助理回覆:
+                if (row.AI助理回覆.startswith("重測仍失敗:") or 
+                    row.AI助理回覆 == "重測未完成（可能被停止）"):
+                    retry_failed_count += 1
+                else:
+                    retry_success_count += 1
+        
+        return {
+            'total_retry_queries': total_queries,
+            'retry_success_count': retry_success_count,
+            'retry_failed_count': retry_failed_count,
+            'retry_success_rate': (retry_success_count / total_queries * 100) if total_queries > 0 else 0.0
+        }
+    
+    def export_retry_results(self, results, output_file, stats):
+        """輸出重測結果到 CSV"""
+        import pandas as pd
+        
+        output_data = []
+        
+        try:
+            for row in results:
+                try:
+                    # 基本信息
+                    row_data = {
+                        '編號': str(row.編號),
+                        '提問者': str(row.提問者),
+                        '問題描述': str(row.問題描述),
+                        '建議 or 正確答案 (if have)': str(row.建議_or_正確答案),
+                        '應參考的文件': str(row.應參考的文件),
+                        '應參考的文件段落': str(row.應參考的文件段落),
+                        '是否檢索KM推薦': str(row.是否檢索KM推薦),
+                        'AI助理回覆': str(row.AI助理回覆),
+                        '引用節點是否命中': str(row.引用節點是否命中),
+                        '參考文件是否正確': str(row.參考文件是否正確),
+                        '回覆是否滿意': str(row.回覆是否滿意),
+                        # 重測標記
+                        '重測狀態': '成功' if not (row.AI助理回覆.startswith("重測仍失敗:") or 
+                                                  row.AI助理回覆 == "重測未完成（可能被停止）") else '失敗'
+                    }
+                    
+                    output_data.append(row_data)
+                    
+                except Exception as e:
+                    self.log_warning(f"輸出重測記錄失敗 [{row.編號 if hasattr(row, '編號') else 'Unknown'}]: {str(e)}")
+                    continue
+            
+            # 創建 DataFrame 並寫入 CSV
+            df = pd.DataFrame(output_data)
+            df.to_csv(output_file, index=False, encoding='utf-8-sig')
+            
+            self.log_info(f"重測結果已輸出到: {output_file}")
+            self.log_info(f"重測統計: 成功 {stats['retry_success_count']} 題, 失敗 {stats['retry_failed_count']} 題")
+            
+        except Exception as e:
+            self.log_error(f"輸出重測結果失敗: {str(e)}")
+            raise
+    
+    def export_integrated_results(self, retry_results, original_csv_file, output_file, stats):
+        """輸出整合結果到CSV（重測結果與原始數據整合）"""
+        import pandas as pd
+        
+        try:
+            # 讀取原始CSV文件
+            self.log_info("讀取原始CSV文件...")
+            original_df = self._read_csv_with_encoding_detection(original_csv_file)
+            
+            # 創建重測結果映射（以編號為鍵）
+            retry_map = {}
+            for row in retry_results:
+                retry_map[str(row.編號)] = row
+            
+            # 整合數據
+            integrated_data = []
+            updated_count = 0
+            
+            for _, original_row in original_df.iterrows():
+                row_id = str(original_row.get('編號', ''))
+                
+                # 檢查是否有重測結果
+                if row_id in retry_map:
+                    retry_row = retry_map[row_id]
+                    updated_count += 1
+                    
+                    # 使用重測後的數據
+                    row_data = {
+                        '編號': str(retry_row.編號),
+                        '提問者': str(retry_row.提問者),
+                        '問題描述': str(retry_row.問題描述),
+                        '建議 or 正確答案 (if have)': str(retry_row.建議_or_正確答案),
+                        '應參考的文件': str(retry_row.應參考的文件),
+                        '應參考的文件段落': str(retry_row.應參考的文件段落),
+                        '是否檢索KM推薦': str(retry_row.是否檢索KM推薦),
+                        'AI助理回覆': str(retry_row.AI助理回覆),
+                        '引用節點是否命中': str(retry_row.引用節點是否命中),
+                        '參考文件是否正確': str(retry_row.參考文件是否正確),
+                        '回覆是否滿意': str(retry_row.回覆是否滿意),
+                        '重測狀態': '重測成功' if not (retry_row.AI助理回覆.startswith("重測仍失敗:") or 
+                                                  retry_row.AI助理回覆 == "重測未完成（可能被停止）") else '重測失敗'
+                    }
+                    
+                    # 如果有RAG指標，也要更新
+                    if hasattr(retry_row, 'Precision'):
+                        row_data['Precision'] = getattr(retry_row, 'Precision', 0.0)
+                        row_data['Recall'] = getattr(retry_row, 'Recall', 0.0)
+                        row_data['F1-Score'] = getattr(retry_row, 'F1-Score', 0.0)
+                        row_data['Hit Rate'] = getattr(retry_row, 'Hit Rate', 0.0)
+                    
+                else:
+                    # 使用原始數據，但添加重測狀態標記
+                    row_data = {}
+                    for col in original_df.columns:
+                        row_data[col] = str(original_row.get(col, ''))
+                    
+                    # 如果沒有重測狀態欄位，新增一個
+                    if '重測狀態' not in row_data:
+                        row_data['重測狀態'] = '未重測'
+                
+                integrated_data.append(row_data)
+            
+            # 創建 DataFrame 並寫入 CSV
+            df = pd.DataFrame(integrated_data)
+            df.to_csv(output_file, index=False, encoding='utf-8-sig')
+            
+            self.log_info(f"✅ 整合結果已輸出到: {output_file}")
+            self.log_info(f"📊 整合統計: 原始記錄 {len(original_df)} 筆, 重測更新 {updated_count} 筆")
+            self.log_info(f"🔄 重測結果: 成功 {stats['retry_success_count']} 題, 失敗 {stats['retry_failed_count']} 題")
+            
+            return output_file
+            
+        except Exception as e:
+            self.log_error(f"輸出整合結果失敗: {str(e)}")
+            raise
+    
+    def show_retry_results(self, results, stats, retry_file, integrated_file=None):
+        """顯示重測結果"""
+        if hasattr(self, 'stats_text'):
+            self.stats_text.config(state='normal')
+            self.stats_text.delete(1.0, tk.END)
+            
+            # 根據是否有整合文件決定顯示內容
+            if integrated_file:
+                stats_str = f"""=== 重測驗證統計結果 ===
+總重測問題數: {stats['total_retry_queries']}
+重測成功數: {stats['retry_success_count']}
+重測失敗數: {stats['retry_failed_count']}
+重測成功率: {stats['retry_success_rate']:.2f}%
+
+🔄 重測結果文件: {retry_file}
+📋 整合完整文件: {integrated_file}
+"""
+            else:
+                stats_str = f"""=== 重測驗證統計結果 ===
+總重測問題數: {stats['total_retry_queries']}
+重測成功數: {stats['retry_success_count']}
+重測失敗數: {stats['retry_failed_count']}
+重測成功率: {stats['retry_success_rate']:.2f}%
+
+重測結果已輸出到: {retry_file}
+"""
+            
+            self.stats_text.insert(1.0, stats_str)
+            self.stats_text.config(state='disabled')
+        
+        # 顯示成功訊息
+        if integrated_file:
+            messagebox.showinfo(
+                "重測完成", 
+                f"重測完成！\n\n"
+                f"總問題數: {stats['total_retry_queries']}\n"
+                f"成功: {stats['retry_success_count']} 題\n"
+                f"失敗: {stats['retry_failed_count']} 題\n"
+                f"成功率: {stats['retry_success_rate']:.1f}%\n\n"
+                f"🔄 重測結果文件: {retry_file}\n"
+                f"📋 整合完整文件: {integrated_file}\n\n"
+                f"整合文件包含所有原始記錄和重測更新！"
+            )
+        else:
+            messagebox.showinfo(
+                "重測完成", 
+                f"重測完成！\n\n"
+                f"總問題數: {stats['total_retry_queries']}\n"
+                f"成功: {stats['retry_success_count']} 題\n"
+                f"失敗: {stats['retry_failed_count']} 題\n"
+                f"成功率: {stats['retry_success_rate']:.1f}%\n\n"
+                f"結果已保存到: {retry_file}"
+            )
+    
+    def reset_retry_ui(self):
+        """重設重測UI狀態"""
+        self.retry_failed_button.config(state='normal')
+        self.start_button.config(state='normal')
+        self.stop_button.config(state='disabled')
+        self.progress_label.config(text="重測完成")
     
     async def process_user_questions(self, client, user, user_questions, semaphore, total_questions, progress_lock, results_dict):
         """處理單個提問者的所有問題"""
@@ -2761,12 +3988,77 @@ class MaiAgentValidatorGUI:
         # 獲取或創建對話
         conversation_id = self.conversation_manager.get_conversation_id(validation_row.提問者)
         
+        # 構建要發送的問題內容
+        if conversation_id is None:
+            # 這是新對話，檢查是否需要組合前面的問題
+            if self.enable_context_combination.get():
+                message_content = self.conversation_manager.build_context_message(
+                    validation_row.提問者, 
+                    validation_row.問題描述
+                )
+                
+                # 記錄上下文構建情況
+                previous_questions = self.conversation_manager.get_context_questions(validation_row.提問者)
+                if previous_questions:
+                    self.log_info(
+                        f"提問者 '{validation_row.提問者}' 開始新對話，組合了 {len(previous_questions)} 個前面的問題", 
+                        'Validation'
+                    )
+                else:
+                    self.log_info(
+                        f"提問者 '{validation_row.提問者}' 開始新對話，沒有前面的問題", 
+                        'Validation'
+                    )
+            else:
+                # 上下文組合已停用，直接使用當前問題
+                message_content = validation_row.問題描述
+                self.log_info(
+                    f"提問者 '{validation_row.提問者}' 開始新對話（上下文組合已停用）", 
+                    'Validation'
+                )
+        else:
+            # 這是已存在對話的延續，直接使用當前問題
+            message_content = validation_row.問題描述
+            self.log_info(
+                f"提問者 '{validation_row.提問者}' 繼續現有對話 {conversation_id}", 
+                'Validation'
+            )
+        
+        # 將當前問題添加到上下文中（用於後續問題）
+        self.conversation_manager.add_question_to_context(validation_row.提問者, validation_row.問題描述)
+        
+        # 構建 query_metadata（如果啟用）
+        query_metadata = None
+        if self.enable_query_metadata.get() and self.knowledge_base_id.get().strip():
+            knowledge_bases = [
+                {
+                    "knowledge_base_id": self.knowledge_base_id.get().strip(),
+                    "has_user_selected_all": True
+                }
+            ]
+            
+            query_metadata = {
+                "knowledge_bases": knowledge_bases
+            }
+            
+            # 如果提供了標籤ID，添加標籤過濾
+            if self.label_id.get().strip():
+                query_metadata["label_relations"] = {
+                    "operator": "OR",
+                    "conditions": [
+                        {"label_id": self.label_id.get().strip()}
+                    ]
+                }
+            
+            self.log_info(f"使用 Query Metadata: {query_metadata}", 'Validation')
+        
         # 發送問題（使用重試機制）
         response = await client.send_message(
             self.selected_chatbot_id, 
-            validation_row.問題描述, 
+            message_content,  # 使用構建的完整內容
             conversation_id,
-            max_retries=self.max_retries.get()
+            max_retries=self.max_retries.get(),
+            query_metadata=query_metadata
         )
         
         # 更新對話 ID
@@ -2804,17 +4096,40 @@ class MaiAgentValidatorGUI:
         
         validation_row.引用節點是否命中 = "是" if citation_hit else "否"
         
-        file_match, file_stats = self.text_matcher.check_citation_file_match(
-            response.citations,
-            validation_row.應參考的文件
-        )
-        validation_row.參考文件是否正確 = "是" if file_match else "否"
+        # 僅使用應參考文件UUID進行匹配
+        expected_files = validation_row.應參考文件UUID.strip()
+        
+        if expected_files:
+            file_match, file_stats = self.text_matcher.check_citation_file_match(
+                response.citations,
+                expected_files
+            )
+            validation_row.參考文件是否正確 = "是" if file_match else "否"
+        else:
+            # 如果沒有UUID，跳過文件匹配
+            file_match = False
+            file_stats = {
+                "detail": "無UUID資料，跳過文件匹配",
+                "total_expected": 0,
+                "total_matched": 0,
+                "hit_rate": 0.0,
+                "matched_files": [],
+                "unmatched_files": [],
+                "all_matched": False
+            }
+            validation_row.參考文件是否正確 = "未檢測"
         
         # 儲存參考文件命中統計數據
         validation_row.參考文件命中率 = file_stats.get('hit_rate', 0.0)
         validation_row.期望文件總數 = file_stats.get('total_expected', 0)
         validation_row.命中文件數 = file_stats.get('total_matched', 0)
-        validation_row.未命中文件 = ', '.join(file_stats.get('unmatched_files', []))
+        
+        # UUID格式的命中和未命中文件信息
+        matched_files = file_stats.get('matched_files', [])
+        validation_row.命中文件 = ', '.join(matched_files) if matched_files else ""
+        
+        unmatched_files = file_stats.get('unmatched_files', [])
+        validation_row.未命中文件 = ', '.join(unmatched_files) if unmatched_files else ""
         
         # 回覆是否滿意保持空白，供客戶手動輸入
         # validation_row.回覆是否滿意 預設為空字串，不自動填寫
@@ -2845,27 +4160,23 @@ class MaiAgentValidatorGUI:
             setattr(validation_row, field_name, content)
 
     def _add_citation_file_fields(self, validation_row, citations):
-        """動態添加參考文件欄位（僅顯示標籤，過濾重複）"""
-        # 收集所有標籤，自動過濾重複
-        unique_labels = set()
+        """動態添加參考文件欄位（使用文件UUID，過濾重複）"""
+        # 收集所有文件UUID，自動過濾重複
+        unique_file_ids = set()
         
         for citation in citations:
-            labels = citation.get('labels', [])
-            
-            # 收集所有標籤名稱
-            for label in labels:
-                label_name = label.get('name', '').strip()
-                if label_name:  # 只添加非空標籤
-                    unique_labels.add(label_name)
+            file_id = citation.get('id', '').strip()
+            if file_id:  # 只添加非空UUID
+                unique_file_ids.add(file_id)
         
-        # 將標籤轉換為排序的列表
-        label_list = sorted(list(unique_labels))
+        # 將UUID轉換為排序的列表
+        file_id_list = sorted(list(unique_file_ids))
         
-        # 為每個標籤添加獨立欄位
-        for i, label_name in enumerate(label_list, 1):
+        # 為每個文件UUID添加獨立欄位
+        for i, file_id in enumerate(file_id_list, 1):
             chinese_num = self.get_chinese_number(i)
             field_name = f'參考文件{chinese_num}'
-            setattr(validation_row, field_name, label_name)
+            setattr(validation_row, field_name, file_id)
 
     def calculate_statistics(self, results):
         """計算增強統計結果"""
@@ -2887,7 +4198,11 @@ class MaiAgentValidatorGUI:
                 'avg_file_hit_rate': 0.0,
                 'total_expected_files': 0,
                 'total_matched_files': 0,
-                'file_level_hit_rate': 0.0
+                'file_level_hit_rate': 0.0,
+                # 重試統計
+                'retry_success_count': 0,
+                'retry_failed_count': 0,
+                'original_failed_count': 0
             }
         
         # 基本統計
@@ -2923,6 +4238,20 @@ class MaiAgentValidatorGUI:
         total_matched_files = sum(row.命中文件數 for row in results)
         total_file_hit_rate = sum(row.參考文件命中率 for row in results)
         
+        # 計算重試統計
+        retry_success_count = 0
+        retry_failed_count = 0
+        original_failed_count = 0
+        
+        for row in results:
+            if hasattr(row, 'AI助理回覆') and row.AI助理回覆:
+                if row.AI助理回覆.startswith("錯誤:") or "API 請求在" in row.AI助理回覆:
+                    original_failed_count += 1
+                elif row.AI助理回覆.startswith("重試失敗:"):
+                    retry_failed_count += 1
+                elif "重試成功" in getattr(row, '_retry_info', ''):  # 如果有重試標記
+                    retry_success_count += 1
+        
         return {
             'total_queries': total_queries,
             'citation_hit_rate': citation_hits / total_queries * 100,
@@ -2941,6 +4270,10 @@ class MaiAgentValidatorGUI:
             'total_expected_files': total_expected_files,
             'total_matched_files': total_matched_files,
             'file_level_hit_rate': (total_matched_files / total_expected_files * 100) if total_expected_files > 0 else 0.0,
+            # 重試統計
+            'retry_success_count': retry_success_count,
+            'retry_failed_count': retry_failed_count,
+            'original_failed_count': original_failed_count,
             'rag_mode_enabled': True  # 固定啟用 RAG 模式
         }
         
@@ -3296,6 +4629,11 @@ class MaiAgentValidatorGUI:
 總期望文件數: {stats['total_expected_files']}
 總命中文件數: {stats['total_matched_files']}
 
+=== 重試處理統計 ===
+重試成功問題數: {stats['retry_success_count']}
+重試失敗問題數: {stats['retry_failed_count']}
+原始失敗問題數: {stats['original_failed_count']}
+
 結果已輸出到: {output_file}
 """
         else:
@@ -3417,7 +4755,7 @@ TOP 10 Hit Rate: {stats['top_10_hit_rate']:.2f}%
             elif level.upper() == 'CRITICAL':
                 log_instance.critical(message)
             
-            # 更新 GUI 顯示（線程安全）
+            # 更新 GUI 顯示（優化版）
             def update_log():
                 if not self.gui_running:
                     return
@@ -3425,41 +4763,73 @@ TOP 10 Hit Rate: {stats['top_10_hit_rate']:.2f}%
                 try:
                     if not hasattr(self, 'log_text') or not self.log_text.winfo_exists():
                         return
+                    
+                    # 檢查日誌級別過濾
+                    level_filter = getattr(self, 'log_level_var', None)
+                    if level_filter and level_filter.get() != "ALL":
+                        level_priority = {'DEBUG': 0, 'INFO': 1, 'WARNING': 2, 'ERROR': 3, 'CRITICAL': 4}
+                        if level_priority.get(level.upper(), 1) < level_priority.get(level_filter.get(), 1):
+                            return  # 跳過低級別日誌
+                    
+                    # 檢查日誌類型過濾
+                    type_filter = getattr(self, 'log_type_var', None)
+                    if type_filter and type_filter.get() != "ALL" and type_filter.get() != logger_name:
+                        return  # 跳過不匹配的類型
                         
                     self.log_text.config(state='normal')
                     
-                    # 根據日誌級別設定顏色標籤
-                    color_tag = level.lower()
+                    # 創建優化的日誌格式
+                    level_icon = self.get_log_level_icon(level)
+                    type_icon = self.get_log_type_icon(logger_name)
+                    timestamp = pd.Timestamp.now().strftime('%H:%M:%S.%f')[:-3]  # 包含毫秒
                     
-                    # 安全地檢查標籤是否存在並配置顏色
-                    try:
-                        # 嘗試獲取標籤配置，如果不存在會拋出異常
-                        existing_color = self.log_text.tag_cget(color_tag, 'foreground')
-                        if not existing_color:
-                            raise Exception("標籤未配置顏色")
-                    except:
-                        # 標籤不存在或未配置，創建新標籤
-                        if level.upper() == 'ERROR' or level.upper() == 'CRITICAL':
-                            self.log_text.tag_config(color_tag, foreground='red')
-                        elif level.upper() == 'WARNING':
-                            self.log_text.tag_config(color_tag, foreground='orange')
-                        elif level.upper() == 'DEBUG':
-                            self.log_text.tag_config(color_tag, foreground='gray')
-                        else:
-                            self.log_text.tag_config(color_tag, foreground='black')
+                    # 格式化消息
+                    formatted_line = f"[{timestamp}] {type_icon} {level_icon} {logger_name.upper():<10} | {message}\n"
                     
-                    # 插入帶顏色的文字
-                    start_pos = self.log_text.index(tk.END + "-1c")
-                    self.log_text.insert(tk.END, f"{formatted_message}\n")
-                    end_pos = self.log_text.index(tk.END + "-1c")
-                    self.log_text.tag_add(color_tag, start_pos, end_pos)
+                    # 插入時間戳（灰色小字）
+                    timestamp_start = self.log_text.index(tk.END + "-1c")
+                    self.log_text.insert(tk.END, f"[{timestamp}] ")
+                    timestamp_end = self.log_text.index(tk.END + "-1c")
+                    self.log_text.tag_add('timestamp', timestamp_start, timestamp_end)
+                    
+                    # 插入類型圖標（彩色）
+                    type_start = self.log_text.index(tk.END + "-1c")
+                    self.log_text.insert(tk.END, f"{type_icon} ")
+                    type_end = self.log_text.index(tk.END + "-1c")
+                    self.log_text.tag_add(f'{logger_name.lower()}_tag', type_start, type_end)
+                    
+                    # 插入級別圖標和文字（根據級別著色）
+                    level_start = self.log_text.index(tk.END + "-1c")
+                    self.log_text.insert(tk.END, f"{level_icon} {logger_name.upper():<10} | {message}")
+                    level_end = self.log_text.index(tk.END + "-1c")
+                    self.log_text.tag_add(level.lower(), level_start, level_end)
+                    
+                    # 檢查搜索高亮
+                    search_text = getattr(self, 'log_search_var', None)
+                    if search_text and search_text.get():
+                        search_term = search_text.get().lower()
+                        if search_term in message.lower():
+                            # 高亮搜索結果
+                            line_start = timestamp_start
+                            self.log_text.tag_add('search_highlight', line_start, level_end)
+                    
+                    self.log_text.insert(tk.END, "\n")
+                    
+                    # 更新統計
+                    if hasattr(self, 'log_stats'):
+                        self.log_stats[level.upper()] = self.log_stats.get(level.upper(), 0) + 1
+                        self.log_stats['total'] = self.log_stats.get('total', 0) + 1
+                        self.update_log_stats()
                     
                     # 限制日誌顯示行數（避免過多日誌影響效能）
                     line_count = int(self.log_text.index('end-1c').split('.')[0])
-                    if line_count > 1000:
-                        self.log_text.delete('1.0', '500.0')
+                    if line_count > 1500:  # 增加限制到1500行
+                        self.log_text.delete('1.0', '750.0')  # 刪除前750行
                     
-                    self.log_text.see(tk.END)
+                    # 自動滾動（可控制）
+                    if getattr(self, 'auto_scroll_var', None) and self.auto_scroll_var.get():
+                        self.log_text.see(tk.END)
+                    
                     self.log_text.config(state='disabled')
                 except Exception as e:
                     # 防止日誌記錄本身出錯，使用靜默失敗
@@ -3543,7 +4913,19 @@ TOP 10 Hit Rate: {stats['top_10_hit_rate']:.2f}%
         self.log_text.config(state='normal')
         self.log_text.delete(1.0, tk.END)
         self.log_text.config(state='disabled')
-        self.log_info("日誌顯示已清空")
+        
+        # 重置日誌統計
+        if hasattr(self, 'log_stats'):
+            self.log_stats = {
+                'DEBUG': 0,
+                'INFO': 0,
+                'WARNING': 0,
+                'ERROR': 0,
+                'total': 0
+            }
+            self.update_log_stats()
+        
+        self.log_info("🗑️ 日誌顯示已清空")
     
     def export_logs(self):
         """匯出當前顯示的日誌"""
@@ -4015,6 +5397,18 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                     load_all = config['knowledge_base'].getboolean('load_all_at_once', True)
                     self.load_all_at_once.set(load_all)
             
+            # 載入 query_metadata 設定
+            if 'query_metadata' in config:
+                self.enable_query_metadata.set(config['query_metadata'].getboolean('enable', False))
+                self.knowledge_base_id.set(config['query_metadata'].get('knowledge_base_id', ''))
+                self.label_id.set(config['query_metadata'].get('label_id', ''))
+                # 更新 UI 狀態
+                self.on_query_metadata_toggle()
+            
+            # 載入上下文組合設定
+            if 'context' in config:
+                self.enable_context_combination.set(config['context'].getboolean('enable_combination', True))
+            
             # 載入分隔符設定
             if 'separators' in config:
                 # 建立分隔符別名映射（與保存時相同）
@@ -4086,6 +5480,18 @@ Validation Logger: {self.validation_logger.name} (Level: {self.validation_logger
                 'export_dir': self.kb_export_dir.get(),
                 'concurrent_downloads': str(self.concurrent_downloads.get()),
                 'load_all_at_once': str(getattr(self, 'load_all_at_once', tk.BooleanVar(value=True)).get())
+            }
+            
+            # 保存 query_metadata 設定
+            config['query_metadata'] = {
+                'enable': str(self.enable_query_metadata.get()),
+                'knowledge_base_id': self.knowledge_base_id.get(),
+                'label_id': self.label_id.get()
+            }
+            
+            # 保存上下文組合設定
+            config['context'] = {
+                'enable_combination': str(self.enable_context_combination.get())
             }
             
             # 保存分隔符設定
